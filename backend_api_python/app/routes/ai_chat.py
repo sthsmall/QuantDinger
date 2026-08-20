@@ -853,6 +853,14 @@ def _needs_intelligence_context(message: str, intent: str) -> bool:
 def _extract_symbol_terms(message: str) -> list[str]:
     text = message or ""
     terms: list[str] = []
+    # A-share / HK numeric codes (6-digit for CN stocks & ETFs, e.g. 600519,
+    # 512480, 000001; 5-digit HK like 0700 is usually written with a suffix).
+    # These must be detected even when embedded in CJK text (no letter anchor).
+    for match in re.finditer(r"(?<![0-9])(\d{6})(?![0-9])", text):
+        code = match.group(1)
+        # Heuristic: plausible A-share/ETF prefixes. Reject obvious years/dates.
+        if code[0] in ("0", "1", "2", "3", "5", "6") and not (code.startswith(("19", "20")) and int(code) > 200000):
+            terms.append(code)
     for match in re.finditer(r"\$?([A-Z]{1,8})(?:\b|[\/\-\._])", text):
         token = match.group(1).upper()
         if token not in {"AI", "API", "LLM", "USD", "USDT", "ETF", "IPO", "CEO", "CPI", "GDP", "FOMC"}:

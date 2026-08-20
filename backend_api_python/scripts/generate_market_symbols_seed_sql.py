@@ -184,12 +184,26 @@ def add_static_rows(col: Collector, market: str | None = None) -> None:
 def add_cn_rows(col: Collector) -> None:
     import akshare as ak  # type: ignore
 
-    df = ak.stock_info_a_code_name()
-    for rec in df_records(df):
-        symbol = clean(rec.get("code") or rec.get("\u4ee3\u7801")).upper()
-        name = rec.get("name") or rec.get("\u540d\u79f0")
-        if re.fullmatch(r"\d{6}", symbol):
-            col.add("CNStock", symbol, name, "CN", "CNY")
+    try:
+        df = ak.stock_info_a_code_name()
+        for rec in df_records(df):
+            symbol = clean(rec.get("code") or rec.get("\u4ee3\u7801")).upper()
+            name = rec.get("name") or rec.get("\u540d\u79f0")
+            if re.fullmatch(r"\d{6}", symbol):
+                col.add("CNStock", symbol, name, "CN", "CNY")
+    except Exception as exc:  # pragma: no cover - best-effort
+        print(f"CNStock equity fetch failed: {exc}")
+
+    # A-share ETFs (separate from equities; stock_info_a_code_name excludes them).
+    try:
+        etf_df = ak.fund_etf_spot_em()
+        for rec in df_records(etf_df):
+            symbol = clean(rec.get("code") or rec.get("\u4ee3\u7801")).upper()
+            name = rec.get("name") or rec.get("\u540d\u79f0")
+            if re.fullmatch(r"\d{6}", symbol):
+                col.add("CNStock", symbol, name, "CN", "CNY")
+    except Exception as exc:  # pragma: no cover - best-effort enrichment
+        print(f"CNStock ETF fetch failed: {exc}")
 
 
 def add_hk_rows(col: Collector) -> None:

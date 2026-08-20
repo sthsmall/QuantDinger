@@ -41,15 +41,15 @@ class BacktestRangePolicy:
 
 
 _DEFAULT_LIMITS: Dict[str, BacktestRangePolicy] = {
-    "1m": BacktestRangePolicy(30, "1 month", "engine workload limit"),
-    "3m": BacktestRangePolicy(30, "1 month", "engine workload limit"),
-    "5m": BacktestRangePolicy(180, "6 months", "engine workload limit"),
-    "15m": BacktestRangePolicy(365, "1 year", "engine workload limit"),
-    "30m": BacktestRangePolicy(365, "1 year", "engine workload limit"),
-    "1H": BacktestRangePolicy(1095, "3 years", "engine workload limit"),
-    "4H": BacktestRangePolicy(1095, "3 years", "engine workload limit"),
-    "1D": BacktestRangePolicy(1095, "3 years", "engine workload limit"),
-    "1W": BacktestRangePolicy(1095, "3 years", "engine workload limit"),
+    "1m": BacktestRangePolicy(36500, "100 years", "engine workload limit"),
+    "3m": BacktestRangePolicy(36500, "100 years", "engine workload limit"),
+    "5m": BacktestRangePolicy(36500, "100 years", "engine workload limit"),
+    "15m": BacktestRangePolicy(36500, "100 years", "engine workload limit"),
+    "30m": BacktestRangePolicy(36500, "100 years", "engine workload limit"),
+    "1H": BacktestRangePolicy(36500, "100 years", "engine workload limit"),
+    "4H": BacktestRangePolicy(36500, "100 years", "engine workload limit"),
+    "1D": BacktestRangePolicy(36500, "100 years", "engine workload limit"),
+    "1W": BacktestRangePolicy(36500, "100 years", "engine workload limit"),
 }
 
 
@@ -58,29 +58,29 @@ _MARKET_LIMITS: Dict[str, Dict[str, BacktestRangePolicy]] = {
     # Keep the cap below the upstream hard edge so indicator warmup does not
     # push an apparently valid user window into an upstream 400.
     "USStock": {
-        "1m": BacktestRangePolicy(7, "7 days", "US stock intraday data provider limit"),
-        "3m": BacktestRangePolicy(7, "7 days", "US stock intraday data provider limit"),
-        "5m": BacktestRangePolicy(60, "60 days", "US stock intraday data provider limit"),
-        "15m": BacktestRangePolicy(60, "60 days", "US stock intraday data provider limit"),
-        "30m": BacktestRangePolicy(60, "60 days", "US stock intraday data provider limit"),
-        "1H": BacktestRangePolicy(700, "about 23 months", "US stock hourly data provider limit"),
-        "4H": BacktestRangePolicy(700, "about 23 months", "US stock hourly data provider limit"),
-        "1D": BacktestRangePolicy(3650, "10 years", "US stock daily data provider limit"),
-        "1W": BacktestRangePolicy(3650, "10 years", "US stock weekly data provider limit"),
+        "1m": BacktestRangePolicy(36500, "100 years", "US stock intraday data provider limit"),
+        "3m": BacktestRangePolicy(36500, "100 years", "US stock intraday data provider limit"),
+        "5m": BacktestRangePolicy(36500, "100 years", "US stock intraday data provider limit"),
+        "15m": BacktestRangePolicy(36500, "100 years", "US stock intraday data provider limit"),
+        "30m": BacktestRangePolicy(36500, "100 years", "US stock intraday data provider limit"),
+        "1H": BacktestRangePolicy(36500, "100 years", "US stock hourly data provider limit"),
+        "4H": BacktestRangePolicy(36500, "100 years", "US stock hourly data provider limit"),
+        "1D": BacktestRangePolicy(36500, "100 years", "US stock daily data provider limit"),
+        "1W": BacktestRangePolicy(36500, "100 years", "US stock weekly data provider limit"),
     },
     # Public forex fallbacks often cap output size or paid subscription depth.
     # These limits avoid silently requesting more bars than the configured
     # provider can return in one backtest run.
     "Forex": {
-        "1m": BacktestRangePolicy(7, "7 days", "forex intraday data provider limit"),
-        "3m": BacktestRangePolicy(30, "30 days", "forex intraday data provider limit"),
-        "5m": BacktestRangePolicy(60, "60 days", "forex intraday data provider limit"),
-        "15m": BacktestRangePolicy(60, "60 days", "forex intraday data provider limit"),
-        "30m": BacktestRangePolicy(120, "120 days", "forex intraday data provider limit"),
-        "1H": BacktestRangePolicy(365, "1 year", "forex hourly data provider limit"),
-        "4H": BacktestRangePolicy(730, "2 years", "forex 4H data provider limit"),
-        "1D": BacktestRangePolicy(1095, "3 years", "forex daily data provider limit"),
-        "1W": BacktestRangePolicy(1095, "3 years", "forex weekly data provider limit"),
+        "1m": BacktestRangePolicy(36500, "100 years", "forex intraday data provider limit"),
+        "3m": BacktestRangePolicy(36500, "100 years", "forex intraday data provider limit"),
+        "5m": BacktestRangePolicy(36500, "100 years", "forex intraday data provider limit"),
+        "15m": BacktestRangePolicy(36500, "100 years", "forex intraday data provider limit"),
+        "30m": BacktestRangePolicy(36500, "100 years", "forex intraday data provider limit"),
+        "1H": BacktestRangePolicy(36500, "100 years", "forex hourly data provider limit"),
+        "4H": BacktestRangePolicy(36500, "100 years", "forex 4H data provider limit"),
+        "1D": BacktestRangePolicy(36500, "100 years", "forex daily data provider limit"),
+        "1W": BacktestRangePolicy(36500, "100 years", "forex weekly data provider limit"),
     },
 }
 

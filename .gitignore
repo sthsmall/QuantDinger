@@ -24,6 +24,8 @@
 .env.*.local
 backend.env
 backend_api_python/.env
+opencode.json
+opencode.jsonc
 .codex-review/
 
 # ========================

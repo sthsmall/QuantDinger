@@ -167,17 +167,54 @@ def search_symbols():
         exchange_id = (request.args.get('exchange_id') or request.args.get('exchangeId') or '').strip()
         market_type = (request.args.get('market_type') or request.args.get('marketType') or '').strip()
 
-        if not market or not keyword:
+        if not keyword:
             return jsonify({'code': 1, 'msg': 'success', 'data': []})
 
-        out = search_market_symbols(
-            market=market,
-            keyword=keyword,
-            limit=limit,
-            exchange_id=exchange_id,
-            market_type=market_type,
-        )
-        return jsonify({'code': 1, 'msg': 'success', 'data': out})
+        if market:
+            out = search_market_symbols(
+                market=market,
+                keyword=keyword,
+                limit=limit,
+                exchange_id=exchange_id,
+                market_type=market_type,
+            )
+            return jsonify({'code': 1, 'msg': 'success', 'data': out})
+
+        # No explicit market: search across the enabled non-crypto markets so the
+        # web/mobile picker works even when it omits the market query param.
+        # Crypto is excluded here because it needs an exchange context; clients
+        # that search crypto already pass a market.
+        try:
+            from app.utils.market_visibility import is_market_visible
+            from app.utils.agent_auth import parse_csv_list
+            import os
+
+            enabled_raw = str(os.environ.get('ENABLED_MARKETS', '') or '').strip()
+            if enabled_raw:
+                markets = parse_csv_list(enabled_raw)
+            else:
+                markets = ['CNStock', 'HKStock', 'USStock', 'Forex', 'Futures', 'MOEX']
+            per = max(1, max(1, limit) // max(1, len(markets)))
+            results = []
+            seen = set()
+            for m in markets:
+                if m == 'Crypto' or not is_market_visible(m):
+                    continue
+                for row in search_market_symbols(market=m, keyword=keyword, limit=per):
+                    key = (row.get('market'), row.get('symbol'))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append(row)
+                    if len(results) >= limit:
+                        break
+                if len(results) >= limit:
+                    break
+            return jsonify({'code': 1, 'msg': 'success', 'data': results})
+        except Exception:
+            logger.error("search_symbols (no market) failed", exc_info=True)
+            return jsonify({'code': 1, 'msg': 'success', 'data': []})
+
     except Exception as e:
         logger.error(f"search_symbols failed: {str(e)}")
         logger.error(traceback.format_exc())

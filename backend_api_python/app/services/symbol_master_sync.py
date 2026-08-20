@@ -158,15 +158,30 @@ def _df_records(df) -> list:
 
 
 def fetch_cn_stock_symbols() -> List[SymbolMasterRow]:
-    """Fetch A-share code/name rows from AkShare."""
+    """Fetch A-share code/name rows from AkShare, including ETFs."""
     import akshare as ak  # type: ignore
 
     rows = []
-    for item in _df_records(ak.stock_info_a_code_name()):
-        symbol = _clean_symbol(item.get("code") or item.get("代码"))
-        name = _clean_text(item.get("name") or item.get("名称"))
-        if re.fullmatch(r"\d{6}", symbol) and name:
-            rows.append(SymbolMasterRow("CNStock", symbol, name, "CN", "CNY"))
+    # A-share equities (SSE/SZSE). May be unreachable from some networks; keep
+    # going so the ETF source below still runs.
+    try:
+        for item in _df_records(ak.stock_info_a_code_name()):
+            symbol = _clean_symbol(item.get("code") or item.get("代码"))
+            name = _clean_text(item.get("name") or item.get("名称"))
+            if re.fullmatch(r"\d{6}", symbol) and name:
+                rows.append(SymbolMasterRow("CNStock", symbol, name, "CN", "CNY"))
+    except Exception as exc:  # pragma: no cover - best-effort
+        logger.warning("CNStock equity symbol fetch failed: %s", exc)
+
+    # A-share ETFs (stock_info_a_code_name excludes them; fund_etf_spot_em covers all).
+    try:
+        for item in _df_records(ak.fund_etf_spot_em()):
+            symbol = _clean_symbol(item.get("code") or item.get("代码"))
+            name = _clean_text(item.get("name") or item.get("名称"))
+            if re.fullmatch(r"\d{6}", symbol) and name:
+                rows.append(SymbolMasterRow("CNStock", symbol, name, "CN", "CNY", asset_class="etf"))
+    except Exception as exc:  # pragma: no cover - best-effort enrichment
+        logger.warning("CNStock ETF sync failed: %s", exc)
     return _unique_rows(rows)
 
 

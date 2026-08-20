@@ -27,6 +27,7 @@ import requests
 
 from app.utils.logger import get_logger
 from app.utils.resource_guard import ResourceExhaustedError, assert_fd_available, record_exception
+from app.data_sources.rate_limiter import get_random_user_agent
 
 logger = get_logger(__name__)
 
@@ -46,6 +47,33 @@ def _bypass_proxy() -> Generator[None, None, None]:
     finally:
         for key, val in saved.items():
             os.environ[key] = val
+
+
+@contextmanager
+def _browser_requests_ua() -> Generator[None, None, None]:
+    """Temporarily make requests use a browser User-Agent.
+
+    Several AkShare Eastmoney endpoints reject requests with the default
+    ``python-requests/x.y.z`` UA by closing the connection
+    (``RemoteDisconnected``). ``requests.get`` builds a fresh Session per call
+    from ``requests.utils.default_headers()``, which derives the UA from
+    ``default_user_agent()``. Patching that function during the AkShare call
+    makes the browser UA apply. We restore the original afterwards so the rest
+    of the process keeps its normal UA.
+    """
+    from requests.utils import default_user_agent
+
+    original = default_user_agent
+    browser = get_random_user_agent()
+
+    def _patched(*_args, **_kwargs):
+        return browser
+
+    requests.utils.default_user_agent = _patched
+    try:
+        yield
+    finally:
+        requests.utils.default_user_agent = original
 
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_SEC = 1.5
@@ -336,9 +364,15 @@ def yf_symbol_from_tencent(tencent_code: str, is_hk: bool) -> str:
     if c.startswith("SH"):
         return c[2:] + ".SS"
     if c.startswith("SZ"):
-        return c[2:] + ".SZ"
+        # A-share exchange rule for yfinance: SSE (Shanghai) symbols are 6xxxxx
+        # (stocks) and 5xxxxx (funds/ETFs); everything else maps to SZSE.
+        # yfinance therefore expects 5xxxxx ETFs (e.g. 510300) under .SS, not .SZ.
+        digits = c[2:]
+        if digits[:1] in ("6", "5"):
+            return digits + ".SS"
+        return digits + ".SZ"
     digits = c.lstrip("SHSZ")
-    if digits.startswith("6"):
+    if digits.startswith(("6", "5")):
         return digits + ".SS"
     return digits + ".SZ"
 
@@ -587,7 +621,7 @@ def fetch_akshare_minute_klines(
     df: Any = None
     for attempt in range(_MAX_ATTEMPTS):
         try:
-            with _bypass_proxy():
+            with _bypass_proxy(), _browser_requests_ua():
                 if is_hk:
                     df = ak.stock_hk_hist_min_em(symbol=sym, period=p, adjust=adj, start_date=sd, end_date=ed)
                 else:
@@ -644,7 +678,7 @@ def fetch_akshare_weekly_klines(
     df: Any = None
     for attempt in range(_MAX_ATTEMPTS):
         try:
-            with _bypass_proxy():
+            with _bypass_proxy(), _browser_requests_ua():
                 if is_hk:
                     df = ak.stock_hk_hist(symbol=sym, period="weekly", start_date=start_s, end_date=end_s, adjust="qfq")
                 else:
