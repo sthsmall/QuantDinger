@@ -6,6 +6,7 @@ import inspect
 import math
 import calendar
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -19,20 +20,36 @@ from app.services.factors import (
     get_factor,
     is_talib_available,
 )
+from app.services.instrument_rules import (
+    InstrumentRules,
+    InstrumentRulesSnapshot,
+    default_rules_for_symbol,
+)
 from .contract import CompiledStrategyV2, StrategyV2ContractError, compile_strategy_v2
 from .data import MultiAssetDataPortal
-from .frequencies import normalize_frequency
+from .frequencies import normalize_frequency, periods_per_year
 from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, ProtectionState
 
 
 def _backtest_time_iso(value: Any) -> str:
     """Serialize the UTC-naive market index as an unambiguous UTC instant."""
+    return _cached_backtest_time_iso(pd.Timestamp(value))
+
+
+def _utc_naive_timestamp(value: Any) -> pd.Timestamp:
     timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+    return timestamp
+
+
+@lru_cache(maxsize=8192)
+def _cached_backtest_time_iso(timestamp: pd.Timestamp) -> str:
     if timestamp.tzinfo is None:
         timestamp = timestamp.tz_localize("UTC")
     else:
         timestamp = timestamp.tz_convert("UTC")
-    return timestamp.floor("s").isoformat().replace("+00:00", "Z")
+    return timestamp.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 @dataclass
@@ -207,11 +224,38 @@ class StrategyRuntimeContext:
         self._logs: list[str] = []
         self._default_protection: ProtectionSpec | None = None
         self._indicator_cache: dict[tuple[Any, ...], pd.Series | pd.DataFrame] = {}
+        self._handler_shapes: dict[str, tuple[Any, int | None]] = {}
         self._order_sequence = 0
         self._order_statuses: dict[str, dict[str, Any]] = {}
         self._cancelled_order_ids: set[str] = set()
+        self.live_order_cancellation = False
         self._last_exit_reasons: dict[str, str] = {}
         self.logger = StrategyRuntimeLogger(self.log)
+
+    def invoke_handler(self, name: str, handler: Any, args: tuple[Any, ...]) -> Any:
+        cached = self._handler_shapes.get(name)
+        if cached is None or cached[0] is not handler:
+            parameters = tuple(inspect.signature(handler).parameters.values())
+            count = None if any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters) else sum(
+                item.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                for item in parameters
+            )
+            cached = (handler, count)
+            self._handler_shapes[name] = cached
+        return handler(*args if cached[1] is None else args[:cached[1]])
+
+    def refresh_portal(self, portal: MultiAssetDataPortal) -> None:
+        if self._indicator_cache:
+            for frequency, frames in self.portal.frames_by_frequency.items():
+                updated = portal.frames_by_frequency.get(frequency, {})
+                if any(
+                    key not in updated or not frame.equals(updated[key].iloc[:len(frame)])
+                    for key, frame in frames.items()
+                ):
+                    self._indicator_cache.clear()
+                    break
+        self.portal = portal
+        self.data = StrategyDataView(portal)
 
     def set_default_protection(self, **values: Any) -> None:
         self._default_protection = ProtectionSpec.from_value(values)
@@ -248,9 +292,12 @@ class StrategyRuntimeContext:
         current = dict(self._order_statuses.get(reference) or {})
         if str(current.get("status") or "").strip().lower() == "filled":
             return False
+        queued = any(order.client_order_id == reference for order in self._orders)
+        if queued:
+            self._orders = [order for order in self._orders if order.client_order_id != reference]
         current.update({
             "client_order_id": reference,
-            "status": "cancelled",
+            "status": "cancel_pending" if self.live_order_cancellation and not queued else "cancelled",
             "reason": "cancelled_by_strategy",
         })
         self._order_statuses[reference] = current
@@ -604,7 +651,7 @@ def _builtin_indicator_contract(
     aliases: dict[str, str] = {}
     outputs: tuple[tuple[str, str], ...] = ((name, ""),)
     factor_id = name
-    if name in {"atr", "rsi", "adx"}:
+    if name in {"sma", "atr", "rsi", "adx"}:
         aliases = {"timeperiod": "period"}
     elif name == "macd":
         aliases = {
@@ -648,11 +695,13 @@ class MultiAssetSimulationBroker:
         leverage: float = 1.0,
         commission: float = 0.0005,
         slippage: float = 0.0005,
+        instrument_rules: InstrumentRulesSnapshot | Mapping[str, InstrumentRules | Mapping[str, Any]] | None = None,
     ) -> None:
         self.portfolio = PortfolioState(initial_capital, initial_capital, total_value=initial_capital)
         self.leverage = max(1.0, float(leverage or 1.0))
         self.commission = max(0.0, float(commission or 0.0))
         self.slippage = max(0.0, float(slippage or 0.0))
+        self.instrument_rules = instrument_rules
         self.executions: list[dict[str, Any]] = []
         self.closed_trades: list[dict[str, Any]] = []
         self._entries: dict[str, dict[str, Any]] = {}
@@ -682,7 +731,12 @@ class MultiAssetSimulationBroker:
         batch_orders = list(orders)
         if not batch_orders:
             return deferred
-        equity_before = self.mark_to_market(portal, timestamp)
+        execution_price_overrides = dict(price_overrides or {})
+        equity_before = self.mark_to_market_before_fill(
+            portal,
+            timestamp,
+            price_overrides=execution_price_overrides,
+        )
         cash_before = float(self.portfolio.available_cash)
         target_weights: dict[str, float] = {}
         batch_event_indexes: list[int] = []
@@ -706,7 +760,11 @@ class MultiAssetSimulationBroker:
                 order.symbol,
                 position_side=_normalize_position_side(order.position_side),
             )
-            equity = self.mark_to_market(portal, timestamp)
+            # Every target in one execution batch is sized from the same
+            # pre-fill snapshot. The snapshot contains only prices observable
+            # at the declared fill instant, never the current bar's later
+            # close/high/low values.
+            equity = equity_before
             is_limit_order = order.order_type == "limit" or order.execution_algo == "limit"
             sizing_price = (
                 float(order.limit_price)
@@ -728,6 +786,23 @@ class MultiAssetSimulationBroker:
                 and abs(target_qty) <= 1e-12
                 and abs(current.amount) > 1e-12
             )
+            reconciles_swap_remainder = closes_position and (
+                self._is_crypto_swap_symbol(order.symbol)
+                or str(order.symbol).lower().startswith("crypto:")
+                and str(order.symbol).split("@", 1)[0].upper().endswith(("/USDT", "/USDC", "/USD"))
+            )
+            if (
+                str(order.symbol).lower().startswith("crypto:")
+                and str(order.symbol).split("@", 1)[0].upper().endswith(("/USDT", "/USDC", "/USD"))
+                and order.kind.startswith("target_")
+                and current.amount * target_qty > 0
+                and abs(delta * sizing_price) <= 10.0 + 1e-9
+            ):
+                batch_event_indexes.append(self._append_order_event(self._order_event(
+                    order_id, order, timestamp, "rejected", "target_already_met",
+                    requested_quantity=0.0,
+                )))
+                continue
             if abs(delta) <= 1e-12 or (abs(delta * sizing_price) < 0.01 and not closes_position):
                 batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id, order, timestamp, "rejected", "target_already_met",
@@ -780,9 +855,17 @@ class MultiAssetSimulationBroker:
                     1.0 + self.slippage if delta > 0 else 1.0 - self.slippage
                 )
             requested_delta = delta
-            lot_size = self._lot_size(order.symbol, bar)
+            rules = self._rules_for(order.symbol)
+            lot_size = self._lot_size(order.symbol, rules)
             delta = self._round_to_lot(delta, lot_size)
-            if abs(delta) < lot_size - 1e-12:
+            exact_close_remainder = False
+            if reconciles_swap_remainder and abs(delta) < lot_size - 1e-12 and abs(current.amount * fill_price) <= 10.0:
+                # A simulated position may contain a sub-lot numerical residue.
+                # A target-zero order reconciles that residue exactly instead of
+                # leaving an uncloseable position or silently writing it off.
+                delta = -current.amount
+                exact_close_remainder = True
+            if abs(delta) < lot_size - 1e-12 and not exact_close_remainder:
                 batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id, order, timestamp, "rejected", "minimum_trade_unit",
                     requested_quantity=abs(requested_delta),
@@ -791,7 +874,17 @@ class MultiAssetSimulationBroker:
             liquidity_cap = None if forced_liquidation else self._liquidity_cap(bar, lot_size)
             if liquidity_cap is not None and abs(delta) > liquidity_cap:
                 delta = math.copysign(liquidity_cap, delta)
-            if forced_liquidation:
+                exact_close_remainder = False
+            if reconciles_swap_remainder and current.amount * delta < 0:
+                residual = current.amount + delta
+                if (
+                    0 < abs(residual) < lot_size - 1e-12
+                    and abs(residual * fill_price) <= 10.0
+                    and (liquidity_cap is None or abs(current.amount) <= liquidity_cap)
+                ):
+                    delta = -current.amount
+                    exact_close_remainder = True
+            if forced_liquidation or exact_close_remainder:
                 feasible_delta, constraint_reason = delta, ""
             else:
                 feasible_delta, constraint_reason = self._feasible_delta(
@@ -802,7 +895,7 @@ class MultiAssetSimulationBroker:
                     lot_size=lot_size,
                     position_key=position_key,
                 )
-            if abs(feasible_delta) < lot_size - 1e-12:
+            if abs(feasible_delta) < lot_size - 1e-12 and not exact_close_remainder:
                 batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id,
                     order,
@@ -813,6 +906,37 @@ class MultiAssetSimulationBroker:
                 )))
                 continue
             delta = feasible_delta
+            min_amount = max(0.0, float(rules.min_amount or 0.0))
+            min_notional = max(0.0, float(rules.min_notional or 0.0))
+            pure_reduction = self._is_pure_reduction(current.amount, delta)
+            swap_reduction = (
+                pure_reduction and self._is_crypto_swap_symbol(order.symbol)
+            )
+            if (
+                min_amount > 0
+                and abs(delta) + 1e-12 < min_amount
+                and not forced_liquidation
+                and not swap_reduction
+                and not exact_close_remainder
+            ):
+                batch_event_indexes.append(self._append_order_event(self._order_event(
+                    order_id, order, timestamp, "rejected", "minimum_trade_unit",
+                    requested_quantity=abs(requested_delta),
+                )))
+                continue
+            if (
+                min_notional > 0
+                and fill_price > 0
+                and not forced_liquidation
+                and not swap_reduction
+                and not exact_close_remainder
+                and abs(delta * fill_price) < min_notional
+            ):
+                batch_event_indexes.append(self._append_order_event(self._order_event(
+                    order_id, order, timestamp, "rejected", "min_notional",
+                    requested_quantity=abs(requested_delta),
+                )))
+                continue
             target_qty = current.amount + delta
             remaining_quantity = max(0.0, abs(requested_delta) - abs(delta))
             has_tradable_remainder = (
@@ -828,8 +952,10 @@ class MultiAssetSimulationBroker:
             current.amount = target_qty
             current.avg_cost = _next_average_cost(old_amount, current.avg_cost, delta, fill_price)
             current.last_price = fill_price
+            execution_price_overrides[order.symbol] = fill_price
             self.portfolio.available_cash = projected_cash
             if abs(current.amount) <= 1e-12:
+                current.amount = 0.0
                 self.portfolio.positions.pop(position_key, None)
                 self._protections.pop(position_key, None)
             else:
@@ -882,6 +1008,7 @@ class MultiAssetSimulationBroker:
                 "limit_price": float(order.limit_price or 0.0) if is_limit_order else 0.0,
                 "status": execution_status,
                 "requested_quantity": abs(requested_delta),
+                "sub_lot_reconciled": exact_close_remainder,
             }
             self.executions.append(execution)
             reason = "margin_liquidation" if forced_liquidation else "filled"
@@ -945,6 +1072,7 @@ class MultiAssetSimulationBroker:
             cash_before=cash_before,
             target_weights=target_weights,
             event_indexes=batch_event_indexes,
+            price_overrides=execution_price_overrides,
         )
         return deferred
 
@@ -1057,17 +1185,49 @@ class MultiAssetSimulationBroker:
         return self._round_to_lot(feasible, lot_size), reason
 
     @staticmethod
-    def _lot_size(symbol: str, bar: Mapping[str, Any] | None) -> float:
-        explicit = float((bar or {}).get("lot_size") or 0.0)
+    def _lot_size(symbol: str, rules: InstrumentRules) -> float:
+        explicit = float(rules.amount_step or 0.0)
         if explicit > 0:
             return explicit
         return 1e-8 if str(symbol).startswith("Crypto:") else 1.0
+
+    def _rules_for(self, symbol: str) -> InstrumentRules:
+        source = self.instrument_rules
+        item: InstrumentRules | Mapping[str, Any] | None = None
+        if isinstance(source, InstrumentRulesSnapshot):
+            item = source.get(symbol)
+        elif isinstance(source, Mapping):
+            item = source.get(symbol)
+        if isinstance(item, InstrumentRules):
+            return item
+        if isinstance(item, Mapping):
+            return InstrumentRules.from_mapping(item)
+        return default_rules_for_symbol(symbol)
+
+    @staticmethod
+    def _is_pure_reduction(current_amount: float, delta: float) -> bool:
+        return (
+            current_amount * delta < 0
+            and abs(delta) <= abs(current_amount) + 1e-12
+        )
+
+    @staticmethod
+    def _is_crypto_swap_symbol(symbol: str) -> bool:
+        text = str(symbol or "").strip().lower()
+        if not text.startswith("crypto:") or "@" not in text:
+            return False
+        binding = text.rsplit("@", 1)[-1]
+        return binding == "swap" or binding.endswith(":swap")
 
     @staticmethod
     def _round_to_lot(value: float, lot_size: float) -> float:
         if lot_size <= 0:
             return value
-        units = math.floor(abs(value) / lot_size + 1e-8)
+        ratio = abs(value) / lot_size
+        nearest = round(ratio)
+        # Recover an integral lot count lost to binary arithmetic, without
+        # rounding genuine fractional lots up to a larger order.
+        units = nearest if abs(ratio - nearest) <= max(1e-12, 4 * math.ulp(ratio)) else math.floor(ratio)
         return math.copysign(units * lot_size, value) if units else 0.0
 
     @staticmethod
@@ -1178,8 +1338,13 @@ class MultiAssetSimulationBroker:
         cash_before: float,
         target_weights: Mapping[str, float],
         event_indexes: list[int],
+        price_overrides: Mapping[str, float] | None = None,
     ) -> None:
-        equity_after = self.mark_to_market(portal, timestamp)
+        equity_after = self.mark_to_market_before_fill(
+            portal,
+            timestamp,
+            price_overrides=price_overrides,
+        )
         actual_weights = {
             symbol: position.market_value / equity_after if equity_after else 0.0
             for symbol, position in self.portfolio.positions.items()
@@ -1261,6 +1426,40 @@ class MultiAssetSimulationBroker:
             price = portal.close_at(symbol, timestamp)
             if price is None:
                 price = portal.current(symbol, "close", position.last_price)
+            position.last_price = float(price or position.last_price or position.avg_cost)
+            total += position.market_value
+        self.portfolio.total_value = total
+        return total
+
+    def mark_to_market_before_fill(
+        self,
+        portal: MultiAssetDataPortal,
+        timestamp: Any,
+        *,
+        price_overrides: Mapping[str, float] | None = None,
+    ) -> float:
+        """Value positions using only information available at the fill instant.
+
+        Market orders execute at the current bar open, so a position with a
+        bar at ``timestamp`` is marked at that open. Sparse instruments fall
+        back to their last completed close through the portal's point-in-time
+        visibility gate. Explicit execution prices cover intrabar protection
+        fills and forced liquidations without exposing the bar close.
+        """
+        total = float(self.portfolio.available_cash)
+        overrides = price_overrides or {}
+        for position_key, position in self.portfolio.positions.items():
+            raw_price = overrides.get(position_key)
+            if raw_price is None:
+                raw_price = overrides.get(position.symbol)
+            try:
+                price = float(raw_price) if raw_price is not None else None
+            except (TypeError, ValueError):
+                price = None
+            if price is None or not math.isfinite(price) or price <= 0:
+                price = portal.open_at(position.symbol, timestamp)
+            if price is None or not math.isfinite(float(price)) or float(price) <= 0:
+                price = portal.current(position.symbol, "close", position.last_price)
             position.last_price = float(price or position.last_price or position.avg_cost)
             total += position.market_value
         self.portfolio.total_value = total
@@ -1500,6 +1699,7 @@ class MultiAssetSimulationBroker:
 
 class StrategyV2BacktestRunner:
     VERSION = "quantdinger-strategy-api-v2"
+    PREFILL_VALUATION_POLICY = "explicit_fill_or_current_open_then_last_completed_close-v1"
 
     def __init__(
         self,
@@ -1514,6 +1714,7 @@ class StrategyV2BacktestRunner:
         commission: float = 0.0005,
         slippage: float = 0.0005,
         universe_resolver=None,
+        instrument_rules: InstrumentRulesSnapshot | Mapping[str, InstrumentRules | Mapping[str, Any]] | None = None,
     ) -> None:
         self.program: CompiledStrategyV2 = compile_strategy_v2(code)
         requested_leverage = max(1.0, float(leverage or 1.0)) if leverage_enabled else 1.0
@@ -1532,7 +1733,9 @@ class StrategyV2BacktestRunner:
             leverage=requested_leverage,
             commission=commission,
             slippage=slippage,
+            instrument_rules=instrument_rules,
         )
+        self.instrument_rules = instrument_rules
         runtime_params = dict(params or {})
         runtime_params.setdefault("commission", self.broker.commission)
         runtime_params.setdefault("slippage", self.broker.slippage)
@@ -1549,9 +1752,9 @@ class StrategyV2BacktestRunner:
     def run(self, *, start_date: Any = None, end_date: Any = None) -> dict[str, Any]:
         timestamps = self.portal.timestamps
         if start_date is not None:
-            timestamps = timestamps[timestamps >= pd.Timestamp(start_date)]
+            timestamps = timestamps[timestamps >= _utc_naive_timestamp(start_date)]
         if end_date is not None:
-            timestamps = timestamps[timestamps <= pd.Timestamp(end_date)]
+            timestamps = timestamps[timestamps <= _utc_naive_timestamp(end_date)]
         if timestamps.empty:
             raise StrategyV2ContractError("strategyV2.backtestRangeEmpty")
 
@@ -1569,9 +1772,6 @@ class StrategyV2BacktestRunner:
             if pending_orders:
                 pending_orders = self.broker.execute(pending_orders, self.portal, timestamp)
                 self._sync_order_statuses()
-            protection_decisions = self.broker.process_protections(self.portal, timestamp)
-            for decision in protection_decisions:
-                self.context.set_last_exit_reason(decision.symbol, decision.reason)
 
             self._invoke("before_trading_start", self.context, self.context.data)
             pending_orders = self._remove_cancelled_orders(pending_orders)
@@ -1596,6 +1796,13 @@ class StrategyV2BacktestRunner:
                     self.broker.execute(opening_orders, self.portal, timestamp),
                 )
                 self._sync_order_statuses()
+
+            # Opening decisions must precede intrabar protection outcomes.
+            # Include newly opened positions in this bar's protection pass.
+            protection_decisions = self.broker.process_protections(self.portal, timestamp)
+            self._sync_order_statuses()
+            for decision in protection_decisions:
+                self.context.set_last_exit_reason(decision.symbol, decision.reason)
 
             self.portal.set_clock(timestamp, include_current=True)
             if self.broker.liquidate_if_insolvent(self.portal, timestamp):
@@ -1688,14 +1895,7 @@ class StrategyV2BacktestRunner:
         if not callable(handler):
             return None
         try:
-            signature = inspect.signature(handler)
-            positional = [
-                item for item in signature.parameters.values()
-                if item.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            ]
-            if any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in signature.parameters.values()):
-                return handler(*args)
-            return handler(*args[:len(positional)])
+            return self.context.invoke_handler(handler_name, handler, args)
         except StrategyV2ContractError:
             raise
         except Exception as exc:
@@ -1710,27 +1910,39 @@ class StrategyV2BacktestRunner:
     ) -> bool:
         current = pd.Timestamp(current)
         previous = pd.Timestamp(previous) if previous is not None else None
-        scheduled_date = current.normalize()
-        if schedule.frequency == "weekly":
-            target_weekday = max(1, min(7, int(schedule.weekday or 1))) - 1
-            scheduled_date = current.normalize() + pd.Timedelta(days=target_weekday - current.weekday())
-        elif schedule.frequency == "monthly":
-            target_day = max(1, int(schedule.monthday or 1))
-            last_day = calendar.monthrange(current.year, current.month)[1]
-            scheduled_date = pd.Timestamp(
-                year=current.year,
-                month=current.month,
-                day=min(target_day, last_day),
-                tz=current.tz,
-            )
-        elif schedule.frequency != "daily":
+        if schedule.frequency not in {"daily", "weekly", "monthly"}:
             return False
 
-        scheduled_at = scheduled_date
-        if _is_intraday_frequency(bar_frequency) and schedule.time:
-            scheduled_at += _parse_schedule_time(schedule.time)
+        def occurrence(anchor: pd.Timestamp) -> pd.Timestamp:
+            scheduled_date = anchor.normalize()
+            if schedule.frequency == "weekly":
+                target_weekday = max(1, min(7, int(schedule.weekday or 1))) - 1
+                scheduled_date += pd.Timedelta(days=target_weekday - anchor.weekday())
+            elif schedule.frequency == "monthly":
+                target_day = max(1, int(schedule.monthday or 1))
+                last_day = calendar.monthrange(anchor.year, anchor.month)[1]
+                scheduled_date = pd.Timestamp(
+                    year=anchor.year,
+                    month=anchor.month,
+                    day=min(target_day, last_day),
+                    tz=anchor.tz,
+                )
+            if _is_intraday_frequency(bar_frequency) and schedule.time:
+                scheduled_date += _parse_schedule_time(schedule.time)
+            return scheduled_date
+
+        scheduled_at = occurrence(current)
         if current < scheduled_at:
-            return False
+            if previous is None or schedule.frequency == "daily":
+                return False
+            # The target day of the previous period may have had no bar
+            # (weekend, holiday).  Catch it up on the first bar after it, as
+            # already happens when the gap stays inside one period.
+            if schedule.frequency == "weekly":
+                scheduled_at = occurrence(current - pd.DateOffset(days=7))
+            else:
+                scheduled_at = occurrence(current.replace(day=1) - pd.DateOffset(days=1))
+            return previous < scheduled_at <= current
         if previous is None:
             return True
         if schedule.frequency == "daily" and not _is_intraday_frequency(bar_frequency):
@@ -1824,8 +2036,14 @@ class StrategyV2BacktestRunner:
             max(1, int(item.get("occurrenceCount") or 1))
             for item in self.broker.order_ledger
         )
+        rules_snapshot = (
+            self.instrument_rules.metadata()
+            if isinstance(self.instrument_rules, InstrumentRulesSnapshot)
+            else None
+        )
         return {
             "initialCapital": initial,
+            "instrumentRulesSnapshot": rules_snapshot,
             "totalReturn": total_return,
             "total_return": total_return,
             "finalEquity": final,
@@ -1898,7 +2116,10 @@ class StrategyV2BacktestRunner:
             "attribution": attribution,
             "logs": list(self.logs),
             "manifest": self.program.manifest.metadata(),
-            "engine": {"version": self.VERSION},
+            "engine": {
+                "version": self.VERSION,
+                "preFillValuationPolicy": self.PREFILL_VALUATION_POLICY,
+            },
             "audit": self._reconcile(),
         }
 
@@ -2050,6 +2271,7 @@ class StrategyV2LiveSession:
         )
         self.portfolio = PortfolioState(initial_capital, initial_capital, total_value=initial_capital)
         self.context = StrategyRuntimeContext(portal=self.portal, portfolio=self.portfolio, params=params)
+        self.context.live_order_cancellation = True
         self.persist_strategy_state = (
             _truthy(self.program.namespace.get("PERSIST_RUNTIME_STATE"))
             or _truthy(self.context.params.get("persist_runtime_state"))
@@ -2083,8 +2305,7 @@ class StrategyV2LiveSession:
         bar_advanced = self.last_processed is None or timestamp > self.last_processed
 
         self.portal = portal
-        self.context.portal = portal
-        self.context.data = StrategyDataView(portal)
+        self.context.refresh_portal(portal)
         self.context.previous_trading_date = self.last_processed
         portal.set_clock(timestamp, include_current=True)
 
@@ -2325,6 +2546,8 @@ class StrategyV2LiveSession:
             "version": 3,
             "protection": self.protection_snapshot(),
         }
+        if self.context._cancelled_order_ids:
+            snapshot["cancelRequests"] = sorted(self.context._cancelled_order_ids)
         if self.persist_strategy_state:
             snapshot.update({
                 "strategyState": _snapshot_state_value(
@@ -2349,6 +2572,7 @@ class StrategyV2LiveSession:
         raw = dict(values or {})
         if not raw:
             return
+        self.context._cancelled_order_ids.update(str(ref) for ref in raw.get("cancelRequests", []))
         protection = raw.get("protection")
         if isinstance(protection, Mapping):
             self.restore_protection_snapshot(protection)
@@ -2402,15 +2626,22 @@ class StrategyV2LiveSession:
                 states[str(symbol)] = state
         self.protection_specs = specs
         self.protection_states = states
-        self._protection_exit_pending = {str(item) for item in (raw.get("exitPending") or [])}
+        # Older snapshots treated every zero-target strategy order as a
+        # protection exit.  A rejected ordinary close could therefore leave an
+        # orphaned latch that suppressed all future orders for the symbol, even
+        # after a runtime restart.  A genuine protection exit always has both a
+        # persisted spec and state, so discard legacy latches that do not.
+        self._protection_exit_pending = {
+            str(item)
+            for item in (raw.get("exitPending") or [])
+            if str(item) in specs and str(item) in states
+        }
 
     def _capture_protection_intents(self, orders: Iterable[OrderIntent]) -> None:
         for order in orders:
             position_key = _position_key(order.symbol, order.position_side)
             if order.protection is not None:
                 self.protection_specs[position_key] = order.protection
-            if order.kind in {"target_quantity", "target_value", "target_percent"} and abs(order.value) <= 1e-12:
-                self._protection_exit_pending.add(position_key)
 
     def _bind_runtime_api(self) -> None:
         ctx = self.context
@@ -2446,14 +2677,7 @@ class StrategyV2LiveSession:
         if not callable(handler):
             return None
         try:
-            signature = inspect.signature(handler)
-            positional = [
-                item for item in signature.parameters.values()
-                if item.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            ]
-            if any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in signature.parameters.values()):
-                return handler(*args)
-            return handler(*args[:len(positional)])
+            return self.context.invoke_handler(handler_name, handler, args)
         except StrategyV2ContractError:
             raise
         except Exception as exc:
@@ -2516,20 +2740,7 @@ def _next_average_cost(old_amount: float, old_cost: float, delta: float, fill_pr
 
 
 def _periods_per_year(frequency: str, markets: Iterable[str]) -> float:
-    normalized = str(frequency or "1d").strip().lower()
-    is_crypto = "Crypto" in set(markets)
-    trading_days = 365.25 if is_crypto else 252.0
-    if normalized.endswith("m"):
-        minutes = max(1, int(normalized[:-1] or 1))
-        session_minutes = 1440.0 if is_crypto else 390.0
-        return trading_days * session_minutes / minutes
-    if normalized.endswith("h"):
-        hours = max(1, int(normalized[:-1] or 1))
-        session_hours = 24.0 if is_crypto else 6.5
-        return trading_days * session_hours / hours
-    if normalized.endswith("w"):
-        return 52.0
-    return trading_days
+    return periods_per_year(frequency, markets)
 
 
 def _execution_identity(old_amount: float, target_amount: float, delta: float) -> tuple[str, str]:

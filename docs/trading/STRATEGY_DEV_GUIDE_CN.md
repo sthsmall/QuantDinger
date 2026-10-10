@@ -147,6 +147,9 @@ Content-Type: application/json
 | A 股 | <code>CNStock:600519.SH</code> |
 | 美股 | <code>USStock:MSFT</code> |
 | 港股 | <code>HKStock:00700.HK</code> |
+| Gate 股票通道港股 | <code>Crypto:00700/HKD@gate:spot</code> |
+| Gate 股票通道美股 | <code>Crypto:AAPL/USD@gate:spot</code> |
+| Binance 港股股票永续 | 当前产品目录返回时使用 <code>Crypto:HK0700/USDT@binance:swap</code> |
 | Crypto 现货 | <code>Crypto:BTC/USDT@spot</code> |
 | 指定交易所 Crypto 现货 | <code>Crypto:BTC/USDT@okx:spot</code> |
 | Crypto 永续 | <code>Crypto:BTC/USDT@swap</code> |
@@ -158,6 +161,53 @@ Content-Type: application/json
 系统也会规范化部分别名，例如 <code>600519.XSHG</code> → <code>CNStock:600519.SH</code>、<code>BTCUSDT</code> → <code>BTC/USDT</code>。
 
 为避免歧义，生产策略应写完整市场前缀。Crypto 未写市场类型时默认为 spot。只有 swap 可以启用合约杠杆。能够解析市场名称并不代表一定有数据或支持实盘，实盘支持范围见第 18 节。
+
+### 交易所股票产品：保留完整交易标的
+
+Gate 港股腾讯使用 <code>Crypto:00700/HKD@gate:spot</code>，Gate 美股苹果使用 <code>Crypto:AAPL/USD@gate:spot</code>。这里的 <code>Crypto</code> 是系统内的交易所路由命名空间，并不表示底层资产一定是加密货币。Gate 股票目录按以下属性记录这两类标的：
+
+| 字段 | 腾讯 | 苹果 |
+| --- | --- | --- |
+| market / symbol | <code>Crypto</code> / <code>00700/HKD</code> | <code>Crypto</code> / <code>AAPL/USD</code> |
+| exchange_id / market_type | <code>gate</code> / <code>spot</code> | <code>gate</code> / <code>spot</code> |
+| asset_class / product_type / api_family | <code>equity</code> / <code>direct_equity</code> / <code>stock</code> | <code>equity</code> / <code>direct_equity</code> / <code>stock</code> |
+| underlying_market / underlying_symbol | <code>HKStock</code> / <code>00700</code> | <code>USStock</code> / <code>AAPL</code> |
+
+筛选时选择交易所 **Gate**、市场类型 **Spot**、产品类型 **Direct Equity**（中文界面显示“交易所股票”，英文显示“Exchange stock”，接口值为 <code>direct_equity</code>），然后搜索 <code>00700</code> 或 <code>AAPL</code>，选择目录返回的准确标的。
+
+其他交易所使用不同的产品契约。Binance bStocks（例如目录确认的 <code>Crypto:NVDAB/USDT@binance:spot</code>）使用 <code>tokenized_equity / spot / spot</code>；Binance 港股股票永续（例如 <code>Crypto:HK0700/USDT@binance:swap</code>）使用 <code>stock_perpetual / swap / swap</code>，只有权威元数据确认港股底层时才映射到 HKStock。两者都不代表直接持有股票。OKX 和 Bybit 可以提供 <code>tokenized_equity / spot / spot</code> 与 <code>stock_perpetual / swap / swap</code>；Bitget Reality 使用 <code>tokenized_equity / spot / reality</code>，并支持目录确认的股票永续。HTX 在没有可靠产品标记和执行契约前关闭股票产品识别。
+
+不能只凭 ticker 猜测产品。产品目录必须提供交易所、市场类型、产品类型、API family、原生 instrument ID、币种和可用的底层身份，策略必须完整保留。如果底层地区未知或系统不支持，因子和基本面保持不可用，不能默认为美股数据。
+
+如果只是研究、因子筛选，或通过传统证券账户交易，则在港股分类添加 <code>HKStock:00700.HK</code>，在美股分类添加 <code>USStock:AAPL</code>。它们与 Gate 通道标的具有不同的执行身份：普通 HKStock 或 USStock 标的不能直接交给 Gate 账户下单，也不能把研究标的静默转换为交易所订单。
+
+Universe、历史数据读取和下单都必须保留选中的交易所完整标识。保留 <code>00700/HKD</code>、<code>AAPL/USD</code> 或目录确认的永续标的，不能删除前导零、替换币种、改为底层股票标识或更换交易所/API family。交易所股票现货仍然只做多，不能调用 <code>allow_leverage</code>。股票永续遵守 Crypto swap 契约：声明方向 metadata；<code>one_way</code> 省略 <code>position_side</code>，分腿模式显式传递；只有源码调用 <code>context.allow_leverage(max_leverage=N)</code> 后才允许配置杠杆。
+
+直接股票、代币化股票、股票永续和普通加密产品的类型由有效产品目录决定，不能只按 ticker 名称猜测。历史行情适配器可以读取目录确认的底层股票市场数据，但不会改变策略的执行标的。策略代码仍使用 Strategy API V2，不应自行请求交易所、券商或行情源 API。编译通过不代表可以立即实盘；部署还会核对产品目录、产品类型/API 通道、交易所、账户能力、交易状态、下单规则与币种。
+
+~~~python
+"""Gate Hong Kong Equity SMA Example
+Uses the selected Gate stock instrument with bounded long-only exposure.
+"""
+
+def initialize(context):
+    g.symbol = "Crypto:00700/HKD@gate:spot"
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1d")
+    context.set_warmup(30)
+    context.set_metadata(direction_mode="long_only")
+
+def handle_data(context, data):
+    bars = get_history(21, "1d", "close", g.symbol)
+    if len(bars) < 20:
+        return
+    bullish = float(bars["close"].iloc[-1]) > float(bars["close"].tail(20).mean())
+    position = get_position(g.symbol)
+    if bullish and position.amount <= 0:
+        order_target_percent(g.symbol, 0.2, reason="sma_entry", stop_loss_pct=0.03)
+    elif not bullish and position.amount > 0:
+        order_target_percent(g.symbol, 0.0, reason="sma_exit")
+~~~
 
 ---
 
@@ -449,6 +499,8 @@ fundamentals = get_fundamentals(
 
 常用公开别名还包括 <code>REVENUE_GROWTH</code>、<code>DEBT_TO_EQUITY</code> 和 <code>FREE_CASH_FLOW</code>。只使用平台真实支持、按时点可见的字段，不要发明字段或读取未来财报。
 
+美股与港股股票池支持持久化当前快照和历史季度财报导入。交易所路由股票（如 <code>Crypto:00700/HKD@gate:spot</code>）会通过底层 <code>HKStock:00700</code> 身份读取时点基本面，同时保留准确的 Gate 产品身份用于实盘下单。
+
 多标的 <code>factor</code>/<code>indicator</code> 调用必须传 symbol；只有单标的数据门户可以省略 symbol。
 
 ---
@@ -471,20 +523,20 @@ Position 常用字段：
 - <code>market_value</code>
 - <code>position_side</code>
 
-swap 双向持仓策略必须显式读取每一条腿：
+显式分腿的 swap 策略（`long_only`、`short_only`、`both` 或 `neutral`）必须读取自己拥有的分腿：
 
 ~~~python
 long_position = get_position(g.symbol, position_side="long")
 short_position = get_position(g.symbol, position_side="short")
 ~~~
 
-在 hedge mode 下，不要把 <code>get_position(symbol)</code> 当成自动合成的净仓位。<code>get_positions()</code> 可能包含 <code>symbol::long</code>、<code>symbol::short</code> 这样的分腿键。判断某条腿是否有仓时建议使用 <code>abs(position.amount)</code>。
+在显式分腿策略中，不要把 <code>get_position(symbol)</code> 当成自动合成的净仓位。<code>get_positions()</code> 可能包含 <code>symbol::long</code>、<code>symbol::short</code> 这样的分腿键。判断某条腿是否有仓时建议使用 <code>abs(position.amount)</code>。<code>one_way</code> 是特意保留的例外：即使交易所账户使用双向持仓，运行时仍会把该策略唯一的活动腿暴露为一个有符号策略持仓。
 
 不要混淆下面几个不同层级的定义：
 
 | 名称 | 所属层级 | 含义 |
 | --- | --- | --- |
-| <code>direction_mode</code> | 策略清单 | 策略被允许使用的方向能力：<code>long_only</code>、<code>short_only</code>、<code>both</code> 或 <code>neutral</code> |
+| <code>direction_mode</code> | 策略清单 | 策略被允许使用的方向能力：<code>long_only</code>、<code>short_only</code>、<code>one_way</code>、<code>both</code> 或 <code>neutral</code> |
 | <code>position_side</code> | 仓位/订单 | 合约 hedge mode 中的 <code>long</code> 或 <code>short</code> 分腿；现货只有 long 库存 |
 | 订单 value/target | 策略源码 | 希望增减或达到的数量、价值、权重；做空目标在源码中使用负数 |
 | <code>open/add/reduce/close</code> | 运行时订单意图 | 引擎根据当前同步仓位和目标差额生成的标准动作，提交数量使用绝对值 |
@@ -575,7 +627,7 @@ order_target_percent(
 )
 ~~~
 
-或设置后续开仓的默认保护：
+或在可执行处理器/定时回调中、下单之前设置后续开仓的默认保护（不要在 <code>initialize</code> 中调用；清单发现阶段不会保留运行时保护状态）：
 
 ~~~python
 set_default_protection(
@@ -622,12 +674,12 @@ def initialize(context):
 新的 Crypto swap 策略应在 `initialize` 中声明方向能力：
 
 ~~~python
-context.set_metadata(direction_mode="both")
+context.set_metadata(direction_mode="one_way")
 ~~~
 
-支持 `long_only`（仅做多）、`short_only`（仅做空）、`both`（多空双向）和 `neutral`（中性双腿）。这个声明不会下单，也不会覆盖策略信号；它用于在部署时分配正确的双向持仓腿，并拒绝超出声明能力的新开仓信号。`both` 和 `neutral` 在实盘中要求交易所账户开启双向持仓模式。
+支持 `long_only`（仅做多）、`short_only`（仅做空）、`one_way`（一个策略持仓在多空之间切换）、`both`（独立多空腿）和 `neutral`（中性双腿）。`one_way` 会自动适配交易所单向持仓账户，或在双向持仓账户中只操作一条活动腿；`both` 和 `neutral` 仍要求双向持仓模式。这个声明不会下单，也不会覆盖策略信号。
 
-新建 Crypto swap 策略必须显式声明 <code>direction_mode</code>，并在每次合约仓位读取和订单调用中显式传入 <code>position_side</code>。编译器对旧源码中 <code>DIRECTION = 1/-1</code> 或字面量仓位腿的推断只用于迁移，不属于推荐契约，也不应作为新模板的实现方式。现货策略按 <code>long_only</code> 编写。
+新建 Crypto swap 策略必须显式声明 <code>direction_mode</code>。<code>one_way</code> 使用 <code>get_position(symbol)</code> 读取有符号净持仓，订单省略 <code>position_side</code>，反转时先平当前方向，等同步为空仓后再开反向。分腿模式则在每次合约仓位读取和订单调用中显式传入 <code>position_side</code>。编译器对旧源码的推断只用于迁移。现货策略按 <code>long_only</code> 编写。
 
 ### 双向持仓示例
 
@@ -683,7 +735,7 @@ def handle_data(context, data):
         )
 ~~~
 
-数量单位取决于交易所合约规格，不能假定一张合约一定等于一个基础币。实盘启动前，平台会确认账户持仓模式；无法确认 hedge mode 时，`both` 和 `neutral` 会按安全原则拒绝启动。运行中的策略会占用账户/交易所/市场/标的/持仓腿；重复占用会返回 <code>strategyV2.liveLegConflict</code>。确认处于 hedge mode 时，两个独立的 long-only 与 short-only 策略可以分别占用相反方向，但声明 <code>both</code> 或 <code>neutral</code> 的策略会同时占用两条腿。
+数量单位取决于交易所合约规格，不能假定一张合约一定等于一个基础币。实盘启动前，平台会确认账户持仓模式。<code>one_way</code> 可以运行在两种账户模式上：双向持仓账户中，运行时会显式路由当前多头或空头腿，并继续强制先平后反转。<code>both</code> 和 <code>neutral</code> 只有确认处于 hedge mode 才能启动。运行中的 <code>one_way</code> 策略会占用账户/交易所/市场/标的的完整策略归属；重复占用返回 <code>strategyV2.liveLegConflict</code>。
 
 不要只用 <code>g.long_qty</code>/<code>g.short_qty</code> 维护权威仓位。订单可能被拒绝、延迟、部分成交或按交易所规则取整。推进策略周期前必须读取同步后的分腿仓位和订单状态。
 
@@ -851,7 +903,7 @@ def rebalance(context, data):
 - 实盘使用交易所返回的成交手续费，并在可用时同步资金费/账户账单。手续费可能以报价币、基础币或平台折扣币收取，因此换算与对账可能晚于成交。
 - 应测试多组手续费和滑点假设。成本轻微上升就失去优势的策略不够稳健。
 
-回测中心还支持因子研究和参数调优。调优可使用网格或随机参数空间，单次最多 500 个组合，并为选中结果报告样本外验证。回测可按系统设置扣除积分；执行失败会自动退款。前端请求超时不等于服务端任务失败，重复提交前应先检查回测历史。
+回测中心还支持因子研究。回测可按系统设置扣除积分；执行失败会自动退款。前端请求超时不等于服务端任务失败，重复提交前应先检查回测历史。
 
 零成交不一定是系统错误：可能是数据不足、条件从未触发、参数不合理、标的无数据或订单被拒绝。先看日志和 orderLedger。
 
@@ -873,11 +925,16 @@ def rebalance(context, data):
 
 | 市场 | 支持的实盘通道 | 产品边界 |
 | --- | --- | --- |
-| Crypto | Binance、Bitget、Bybit、OKX、Gate、HTX | 按交易所和账户能力支持 spot 与 swap |
+| Crypto | Binance、Bitget、Bybit、OKX、Gate、HTX | 普通 spot 与 swap 按交易所和账户能力支持 |
+| 交易所直接股票 | Gate 股票通道 | <code>direct_equity / spot / stock</code>；美股和港股必须保留目录返回的准确币种，只做多 |
+| 交易所代币化股票 | OKX、Bybit、Bitget Reality | OKX/Bybit 使用 <code>tokenized_equity / spot / spot</code>；Bitget 使用 <code>tokenized_equity / spot / reality</code>；必须通过目录和地区可用性校验 |
+| 交易所股票永续 | Binance、OKX、Bitget、Bybit、Gate | <code>stock_perpetual / swap / swap</code>；属于衍生品，遵守 Crypto swap 方向和杠杆规则，必须使用准确原生合约 |
+| Binance bStocks | Binance | <code>tokenized_equity / spot / spot</code>；必须使用目录中的准确交易对（如 <code>NVDAB/USDT</code>），按普通现货下单且不可使用杠杆 |
+| 未验证交易所股票 | HTX | 在权威产品元数据和执行 API family 验证完成前拒绝 |
 | USStock | Alpaca、IBKR | 当前券商策略按 long-only |
 | 其他可解析市场 | 暂无 | 可回测或有数据不等于支持实盘 |
 
-混合市场 live 不支持，其他市场不能强行用不匹配的凭证部署。
+混合市场 live 不支持，其他市场不能强行用不匹配的凭证部署。一个实盘资金分配还必须保持兼容的计价/结算币种和 API family；例如不能因为底层都是港股公司，就把 HKD Gate 直接股票和 USDT 股票永续放进同一资金池。
 
 ### 仓位归属、对账与账户风控
 
@@ -946,12 +1003,12 @@ def rebalance(context, data):
 
 ### 系统预设策略模板
 
-系统预设目录当前使用 <code>system_seed version=11</code>，包含 8 个 CTA 模板（单均线、双均线、阳线穿三线、趋势过滤阳线穿三线、海龟、指标共振、MACD/KDJ、SuperTrend）和 4 个组合模板（市值杠铃、动量 Top N、低波动、质量成长）。预设模板既是示例，也是当前 Strategy API V2 推荐契约的可执行基线。
+系统预设目录包含 8 个 CTA 模板和 4 个组合模板。单向持仓双均线模板使用 <code>system_seed version=12</code>，其余模板仍为 version 11。预设模板既是示例，也是当前 Strategy API V2 推荐契约的可执行基线。
 
 系统预设必须满足：
 
-- 每个模板显式声明 <code>direction_mode</code>；Crypto swap 模板显式读取和操作 <code>position_side</code> 分腿。
-- 双向趋势模板执行“先平反向腿，等待成交与仓位同步，再开目标腿”，不能用一个净仓位变量代替两条腿。
+- 每个模板显式声明 <code>direction_mode</code>。<code>one_way</code> 模板使用不带 <code>position_side</code> 的有符号策略持仓，由运行时适配账户模式；显式分腿模板直接读取和操作各自分腿。
+- 单向持仓趋势模板先平当前反向仓位，等待成交与空仓同步后，再开目标方向。
 - 可从交易所仓位恢复的状态应以同步后的 <code>amount</code>、<code>avg_cost</code> 和订单状态为准；无法可靠重建的状态必须启用 <code>PERSIST_RUNTIME_STATE</code>。
 - 每次目录更新都必须通过参数契约、编译、方向能力和合成回测测试。复制模板后如果修改了市场、方向或周期，应重新验证 manifest，而不是继续依赖模板身份。
 
@@ -991,6 +1048,13 @@ DCA 规则：
 - 马丁属于尾部风险很高的资金管理方式，必须限制总投入、层数、杠杆、止损和止损后是否重新开始。
 
 ---
+
+## 回测回撤与资不抵债口径
+
+- 总收益比较期末权益与初始资金；回撤比较当前权益与此前最高权益，并将初始资金纳入起点。例如净值 100 → 135.68 → 94.52，对应总收益约 -5.48%，最大回撤约 -30.34%。
+- Strategy API V2 用负百分数表示回撤。汇总指标和逐点回撤基于完整记录的权益曲线计算；历史压缩保留最大回撤的峰谷、权益极值，以及首次非正权益点和前一个点。
+- 资不抵债处理采用简化的 K 线收盘模型：收盘估值权益非正时强制平仓，通过 <code>liquidationAdjustment</code> 记录吸收的负余额，并停止后续策略下单。最终权益为零时回撤为 -100%。此模型没有实现各交易所的维持保证金档位或盘中强平价格，不能按交易所的精确强平结果解读。
+- 以前保存的等距采样历史可能已经缺少关键图表点。需要重新回测，才能按新采样规则保存；系统不会自动改写已有历史结果。
 
 ## 21. 发布前检查清单
 

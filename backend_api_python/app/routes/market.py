@@ -354,6 +354,7 @@ def get_price():
         symbol = normalize_symbol(request.args.get('symbol', ''))
         exchange_id = (request.args.get('exchange_id') or request.args.get('exchangeId') or '').strip()
         market_type = (request.args.get('market_type') or request.args.get('marketType') or '').strip()
+        instrument_id = (request.args.get('instrument_id') or request.args.get('instrumentId') or '').strip()
         
         if not market or not symbol:
             return jsonify({
@@ -367,8 +368,8 @@ def get_price():
             return jsonify({'code': 0, 'msg': validation_err, 'data': None}), 400
         
         result = guarded_cached(
-            cache_key("market_price", market, exchange_id, market_type, symbol),
-            lambda: get_single_price(market, symbol, exchange_id, market_type),
+            cache_key("market_price", market, exchange_id, market_type, instrument_id, symbol),
+            lambda: get_single_price(market, symbol, exchange_id, market_type, instrument_id),
             ttl_sec=5,
             stale_ttl_sec=120,
             timeout_sec=6,
