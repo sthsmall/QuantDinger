@@ -1,6 +1,8 @@
 """Runtime overview and strategy control endpoints for Agent Gateway."""
 from __future__ import annotations
 
+import os
+
 from app.routes.agent_v1 import agent_v1_bp
 from app.routes.agent_v1._helpers import envelope, error
 from app.services.strategy import StrategyService
@@ -119,7 +121,7 @@ def stop_strategy(strategy_id: int):
 
     executor_ok = True
     try:
-        from app.routes.strategy_services import get_trading_executor
+        from app import get_trading_executor
 
         executor_ok = bool(get_trading_executor().stop_strategy(strategy_id, persist_status=False))
     except Exception as exc:
@@ -141,3 +143,43 @@ def stop_strategy(strategy_id: int):
         "status": "stopped",
         "executor_stopped": executor_ok,
     }, message="stopped")
+
+
+@agent_v1_bp.route("/strategies/<int:strategy_id>/start", methods=["POST"])
+@agent_required(SCOPE_T)
+def start_strategy(strategy_id: int):
+    """Start one tenant strategy and verify persisted running status."""
+    user_id = current_user_id()
+    strategy = _strategy_service.get_strategy(strategy_id, user_id=user_id)
+    if not strategy:
+        return error(404, "Strategy not found", http=404)
+
+    if str(strategy.get("strategy_type") or "") == "PromptBasedStrategy":
+        return error(400, "PromptBasedStrategy is not supported in local runtime")
+
+    try:
+        from app import get_trading_executor
+
+        executor = get_trading_executor()
+        started = executor.start_strategy(strategy_id)
+    except Exception as exc:
+        logger.warning(f"agent_v1 start executor failed for strategy {strategy_id}: {exc}")
+        return error(500, "Failed to start strategy on executor", details=str(exc), http=500)
+
+    if not started:
+        detail = str(getattr(executor, "_last_start_failure", "") or "")
+        return error(409, detail or "start failed", http=409)
+
+    timeout = max(0.0, float(os.getenv("STRATEGY_COMMAND_START_WAIT_SEC", "8")))
+    running, detail = executor.wait_strategy_running(strategy_id, timeout=timeout)
+    if not running:
+        try:
+            _strategy_service.update_strategy_status(strategy_id, "stopped", user_id=user_id)
+        except Exception:
+            pass
+        return error(409, detail or "start failed", http=409)
+
+    if not _strategy_service.update_strategy_status(strategy_id, "running", user_id=user_id):
+        return error(500, "Failed to persist running status", http=500)
+
+    return envelope({"strategy_id": strategy_id, "status": "running"}, message="started")

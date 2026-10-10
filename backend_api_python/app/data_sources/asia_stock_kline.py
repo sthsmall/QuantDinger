@@ -227,7 +227,7 @@ def _td_symbol_and_exchange(tencent_code: str, is_hk: bool) -> tuple[str, str]:
             num = str(int(num)).zfill(4)
         return num, "HKEX"
     digits = c.lstrip("SHSZ")
-    if c.startswith("SH") or digits.startswith("6"):
+    if c.startswith("SH") or digits[:1] in ("6", "5"):
         return digits, "SSE"
     return digits, "SZSE"
 

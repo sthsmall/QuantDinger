@@ -43,7 +43,9 @@ def normalize_cn_code(symbol: str) -> str:
         return f"SZ{s}"
 
     if s.isdigit() and len(s) == 6:
-        return ("SH" + s) if s.startswith("6") else ("SZ" + s)
+        # SSE (Shanghai) covers 6xxxxx stocks and 5xxxxx funds/ETFs;
+        # everything else (0/2/3xxxxx) maps to SZSE.
+        return ("SH" + s) if s[:1] in ("6", "5") else ("SZ" + s)
 
     return s
 
