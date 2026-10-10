@@ -28,7 +28,10 @@ backend.env.bak.*
 backend_api_python/.env
 opencode.json
 opencode.jsonc
+opencode.json.*.bak
 .codex-review/
+.opencode/
+.playwright-cli/
 
 # ========================
 # IDE & OS
