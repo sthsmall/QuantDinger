@@ -7,7 +7,10 @@ Canonical agent instructions. `CLAUDE.md` only imports this file; do not duplica
 - `backend_api_python/`: the only application source — Flask API (`run.py`, gunicorn), services, trading runtime, migrations, tests.
 - `mcp_server/`: standalone `quantdinger-mcp` package, a tenant-scoped client over `/api/agent/v1`. Own version (`0.6.2`) and own CI.
 - `docs/`: architecture, trading, Agent Gateway, API, deployment docs. Only `README.md` / `README_CN.md` may sit at the `docs/` root (`scripts/check_docs.py` enforces this).
+- `backend_api_python/app/services/live_trading/` and `app/services/quick_trade/`: exchange adapters, WS/REST order transports, reconciliation. Read `docs/trading/LIVE_TRADING_SAFETY.md` before touching them.
+- `backend_api_python/app/research/` + `app/services/factors/`: factor research, custom factors, cross-asset data.
 - `ops/`: Prometheus / Grafana / Alertmanager config, used only by `docker-compose.observability.yml`.
+- `deploy/aws-marketplace/`: AWS Marketplace packaging, separate from the compose stack.
 - `docker-compose*.yml`, `install.sh`, `install.ps1`, `scripts/`: deployment topology and repo tooling.
 - Frontend and mobile source live in private repos; this repo only references prebuilt GHCR images.
 
@@ -60,12 +63,14 @@ Run the ones matching your change; commands below are from `backend_api_python/`
 
 ## Gotchas
 
-- **Migrations are not auto-discovered.** Each SQL file in `migrations/` must be registered in `_apply_init_sql()` in `app/utils/db.py`. Applied components are tracked by SHA-256 checksum, so editing an already-applied file makes it re-run on the next boot.
+- **Migrations have two lifecycles** (`migrations/README.md`): `init.sql` is the canonical schema for fresh installs and is re-applied through the bootstrap ledger; dated `YYYYMMDD_*.sql` upgrades only run when registered in `_apply_init_sql()` in `app/utils/db.py`. Applied components are tracked by SHA-256 checksum, so editing an already-applied file makes it re-run on the next boot — keep registered SQL idempotent.
 - Deploy-time entrypoints are `python -m app.commands.migrate` (strict) and `python -m app.commands.kafka_topics`. Compose orders `env-sync` → `migration` → `kafka-init` → backend/workers; a new module that reads a topic needs it created there.
-- Root `.env` is the single config for Compose and every backend process, and it is gitignored. On `docker compose up`, the `env-sync` service appends missing keys from `.env.example` and writes `.env.bak.<timestamp>`. Never put local values in `.env.example`.
+- Root `.env` is the single config for Compose and every backend process, and it is gitignored. `python scripts/bootstrap_env.py` creates or upgrades it and generates missing credentials without printing them; on `docker compose up`, the `env-sync` service appends missing keys from `.env.example` and writes `.env.bak.<timestamp>`. Never put local values in `.env.example`.
+- Compose now requires a non-empty `POSTGRES_PASSWORD` (no default fallback) and builds `DATABASE_URL` itself from `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`. Keep `DATABASE_URL` empty in `.env` for Docker; set it only when running the backend outside Compose.
 - Version consistency is checked: root `VERSION` and `backend_api_python/VERSION` must match. Bump both with `python scripts/bump_version.py X.Y.Z`. Release images take their version from the git tag or the `APP_VERSION` / `GIT_TAG` build args, not from the `VERSION` file.
 - `docker compose up -d --build` builds the backend from local source but pulls frontend/mobile from GHCR. Building the frontend locally requires `-f docker-compose.build.yml` and a `./QuantDinger-Vue/` checkout.
 - The default stack requires Kafka. Without it, `kafka-init`, `kafka-audit-worker`, `strategy-dispatcher-worker`, and `strategy-evaluator-worker` cannot start.
+- `STRATEGY_MAX_ACTIVE` caps runtimes admitted per trading worker (compose default 3000). Raising it is a capacity decision, not a tuning tweak.
 
 ## API contracts
 
@@ -89,4 +94,5 @@ Run the ones matching your change; commands below are from `backend_api_python/`
 - Strategy API, backtests, trading behavior: `docs/trading/STRATEGY_DEV_GUIDE.md`, `docs/trading/LIVE_TRADING_SAFETY.md`.
 - Runtime ownership, concurrency, Kafka, workers: `docs/architecture/README.md` and the linked document.
 - HTTP conventions: `docs/architecture/API_CONVENTIONS.md`.
+- Install, upgrade, rollback, config keys: `docs/deployment/UPGRADE_ROLLBACK.md`, `docs/deployment/CONFIGURATION_REFERENCE.md`, `docs/deployment/COMPATIBILITY_MATRIX.md`.
 - Install and operations: `README.md`, `DEVELOPMENT.md`, `docs/deployment/`.
