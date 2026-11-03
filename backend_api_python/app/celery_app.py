@@ -45,11 +45,13 @@ celery_app.conf.update(
     imports=(
         "app.tasks.agent_jobs",
         "app.tasks.fast_analysis",
+        "app.tasks.indicator_translation",
         "app.tasks.maintenance",
         "app.tasks.fundamental_sync",
     ),
     task_routes={
         "quantdinger.tasks.fast_analysis": {"queue": "ai"},
+        "quantdinger.tasks.indicator_translation": {"queue": "ai"},
         "quantdinger.tasks.agent_job": {"queue": "jobs"},
         "quantdinger.tasks.expire_agent_jobs": {"queue": "maintenance"},
         "quantdinger.tasks.reflection": {"queue": "maintenance"},

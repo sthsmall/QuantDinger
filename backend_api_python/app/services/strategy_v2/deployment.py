@@ -18,8 +18,9 @@ from app.services.strategy_direction import (
     normalize_direction_mode,
 )
 from app.utils.db import get_db_connection
+from app.utils.trading_venue_visibility import is_trading_venue_enabled
 
-from .contract import StrategyV2ContractError, compile_strategy_v2
+from .contract import PLATFORM_MAX_LEVERAGE, StrategyV2ContractError, compile_strategy_v2
 
 
 class StrategyV2DeploymentService:
@@ -55,6 +56,18 @@ class StrategyV2DeploymentService:
         initial_capital = float(payload.get("initialCapital") or 0)
         if initial_capital <= 0:
             raise StrategyV2ContractError("strategyV2.invalidInitialCapital")
+
+        risk_supplied = any(
+            key in payload
+            for key in ("equityTakeProfitPct", "equityStopLossPct")
+        )
+        try:
+            equity_take_profit_pct = float(payload.get("equityTakeProfitPct") or 0)
+            equity_stop_loss_pct = float(payload.get("equityStopLossPct") or 0)
+        except (TypeError, ValueError) as exc:
+            raise StrategyV2ContractError("strategyV2.invalidEquityRiskLimit") from exc
+        if not 0 <= equity_stop_loss_pct <= 1 or not 0 <= equity_take_profit_pct <= 10:
+            raise StrategyV2ContractError("strategyV2.invalidEquityRiskLimit")
 
         execution_mode = str(payload.get("executionMode") or "signal").strip().lower()
         if execution_mode not in {"signal", "live"}:
@@ -103,7 +116,7 @@ class StrategyV2DeploymentService:
             raise StrategyV2ContractError("strategyV2.leverageCryptoSwapOnly")
         if leverage_enabled and not manifest.leverage_allowed:
             raise StrategyV2ContractError("strategyV2.leverageNotAllowed")
-        if leverage_enabled and leverage > manifest.max_leverage:
+        if leverage_enabled and leverage > PLATFORM_MAX_LEVERAGE:
             raise StrategyV2ContractError("strategyV2.leverageExceedsStrategyLimit")
         leverage = max(1.0, leverage if leverage_enabled else 1.0)
         declared_payload_direction = payload.get("directionMode") or payload.get("direction_mode") or ""
@@ -274,6 +287,17 @@ class StrategyV2DeploymentService:
         self._normalize_grid_runtime_budget(runtime_config)
         if str(runtime_config.get("bot_type") or "").strip().lower() == "grid":
             runtime_config["position_ledger"] = "fills"
+        if risk_supplied:
+            runtime_config.update({
+                "equity_take_profit_pct": equity_take_profit_pct,
+                "equity_stop_loss_pct": equity_stop_loss_pct,
+                "deployment_risk": {
+                    "basis": "initial_capital",
+                    "action": "close_and_stop",
+                    "equity_take_profit_pct": equity_take_profit_pct,
+                    "equity_stop_loss_pct": equity_stop_loss_pct,
+                },
+            })
         runtime_config.update({
             "api_version": 2,
             "script_source_id": source_id,
@@ -420,10 +444,14 @@ class StrategyV2DeploymentService:
         market = next(iter(market_set), "")
         if market == "Crypto" and exchange_id not in supported_crypto_exchange_ids():
             raise StrategyV2ContractError("strategyV2.cryptoCredentialRequired")
-        if market == "USStock" and exchange_id not in {"alpaca", "ibkr"}:
+        if market == "USStock" and exchange_id not in {"alpaca", "ibkr", "tiger", "webull"}:
             raise StrategyV2ContractError("strategyV2.stockCredentialRequired")
-        if market not in {"Crypto", "USStock"}:
+        if market == "HKStock" and exchange_id != "tiger":
+            raise StrategyV2ContractError("strategyV2.stockCredentialRequired")
+        if market not in {"Crypto", "USStock", "HKStock"}:
             raise StrategyV2ContractError("strategyV2.liveMarketUnsupported")
+        if not is_trading_venue_enabled(exchange_id):
+            raise StrategyV2ContractError("strategyV2.tradingVenueDisabled")
 
     @staticmethod
     def _validate_manifest_products(

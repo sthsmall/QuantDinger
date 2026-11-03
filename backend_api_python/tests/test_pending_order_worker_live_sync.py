@@ -4,11 +4,13 @@ import ast
 import inspect
 import json
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 
 from app.services import pending_order_worker as worker_module
 from app.services.live_trading.adapters import LiveOrderPhaseAdapter
+from app.services.pending_orders import live_sync_recovery
 from app.services.pending_orders.sent_order_recovery import (
     is_final_fill,
     normalize_live_order_status,
@@ -87,13 +89,72 @@ def test_live_sent_sync_persists_only_incremental_partial_fill(monkeypatch):
     assert snapshots[0]["filled"] == pytest.approx(0.75)
 
 
+def test_alpaca_filled_order_backfills_authoritative_zero_fee(monkeypatch):
+    class Broker:
+        def get_order_status(self, order_id):
+            assert order_id == "alpaca-order-41"
+            return SimpleNamespace(
+                status="filled",
+                filled=1.0,
+                avg_price=210.5,
+                raw={
+                    "fee_status": "actual_zero",
+                    "fees_by_ccy": {"USD": 0.0},
+                    "commission": 0.0,
+                    "commission_ccy": "USD",
+                    "commission_quote": 0.0,
+                },
+            )
+
+    row = {
+        "id": 41,
+        "user_id": 7,
+        "strategy_id": 9,
+        "symbol": "AAPL",
+        "signal_type": "open_long",
+        "market_type": "USStock",
+        "exchange_id": "alpaca",
+        "exchange_order_id": "alpaca-order-41",
+        "amount": 1.0,
+        "filled": 1.0,
+        "avg_price": 210.5,
+        "payload_json": '{"strategy_id":9,"strategy_run_id":3,"order_intent_id":5,"symbol":"AAPL","signal_type":"open_long"}',
+    }
+    worker = object.__new__(worker_module.PendingOrderWorker)
+    worker._claim_alpaca_sent_order = lambda order_id: dict(row)
+    snapshots = []
+    worker._update_alpaca_sent_order_snapshot = lambda **kwargs: snapshots.append(kwargs)
+    persisted = []
+    monkeypatch.setattr(worker_module, "AlpacaClient", Broker)
+    monkeypatch.setattr(worker_module, "load_strategy_configs", lambda strategy_id: {
+        "user_id": 7,
+        "exchange_config": {"exchange_id": "alpaca"},
+        "market_category": "USStock",
+    })
+    monkeypatch.setattr(worker_module, "resolve_exchange_config", lambda cfg, user_id: dict(cfg))
+    monkeypatch.setattr(worker_module, "create_client", lambda cfg: Broker())
+    monkeypatch.setattr(worker_module, "dispatch_requested_cancel", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "persist_strategy_fill", lambda **kwargs: persisted.append(kwargs) or (None, None))
+    monkeypatch.setattr(worker_module, "append_strategy_log", lambda *args, **kwargs: None)
+
+    worker._sync_one_alpaca_sent_order(row)
+
+    assert persisted[0]["filled"] == 0.0
+    assert persisted[0]["cumulative_fees"] == {"USD": 0.0}
+    assert persisted[0]["cumulative_commission_quote"] == 0.0
+    assert persisted[0]["fee_status"] == "actual_zero"
+    assert snapshots[0]["fee_status"] == "actual_zero"
+    assert snapshots[0]["fee_source"] == "rest"
+
+
 def test_claim_live_sent_order_transitions_the_claimed_row(monkeypatch):
     class Cursor:
         def execute(self, sql, params):
             assert "status = 'syncing'" in sql
             assert "COALESCE(filled, 0) <= 0" in sql
             assert "live_fee_sync:retry" in sql
-            assert params == (41, 300)
+            assert "live_fill_sync:retry_error" in sql
+            assert params == (41, 90, 300)
 
         def fetchone(self):
             return {"id": 41, "status": "syncing"}
@@ -117,8 +178,47 @@ def test_claim_live_sent_order_transitions_the_claimed_row(monkeypatch):
     monkeypatch.setattr(worker_module, "get_db_connection", lambda: Database())
     worker = object.__new__(worker_module.PendingOrderWorker)
     worker._fee_sync_retry_sec = 300
+    worker._stale_processing_sec = 90
 
     assert worker._claim_live_sent_order(41) == {"id": 41, "status": "syncing"}
+
+
+def test_fetch_live_sent_orders_defers_recent_retry_errors(monkeypatch):
+    executed = []
+
+    class Cursor:
+        def execute(self, sql, params):
+            executed.append((sql, params))
+
+        def fetchall(self):
+            return []
+
+        def close(self):
+            return None
+
+    class Database:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            return None
+
+    monkeypatch.setattr(worker_module, "get_db_connection", lambda: Database())
+    worker = object.__new__(worker_module.PendingOrderWorker)
+    worker._stale_processing_sec = 90
+    worker._fee_sync_retry_sec = 300
+
+    assert worker._fetch_live_sent_orders(limit=50) == []
+
+    select_sql, params = executed[1]
+    assert "live_fill_sync:retry_error" in select_sql
+    assert params == (90, 300, 50)
 
 
 def test_fee_reconciliation_is_not_throttled_by_a_healthy_execution_stream():
@@ -147,6 +247,96 @@ def test_fee_reconciliation_limits_each_exchange_account_batch(monkeypatch):
     worker._sync_live_sent_orders()
 
     assert synced == [1, 2]
+
+
+def test_live_sent_sync_restores_claim_after_reconciliation_error(monkeypatch):
+    worker = object.__new__(worker_module.PendingOrderWorker)
+    worker._fee_sync_batch_per_account = 5
+    row = {"id": 41, "exchange_id": "gate", "credential_id": 7, "market_type": "swap"}
+    monkeypatch.setattr(worker, "_fetch_live_sent_orders", lambda limit: [row])
+    monkeypatch.setattr(worker, "_should_rest_reconcile", lambda _row: True)
+    monkeypatch.setattr(
+        worker,
+        "_sync_one_live_sent_order",
+        lambda _row: (_ for _ in ()).throw(RuntimeError("snapshot mismatch")),
+    )
+    restored = []
+    monkeypatch.setattr(
+        worker_module,
+        "restore_live_sent_order_after_sync_error",
+        lambda restored_row, exc: restored.append((restored_row["id"], str(exc))),
+    )
+
+    worker._sync_live_sent_orders()
+
+    assert restored == [(41, "snapshot mismatch")]
+
+
+def test_restore_live_sent_order_after_sync_error_releases_syncing_claim(monkeypatch):
+    executed = []
+
+    class Cursor:
+        def execute(self, sql, params):
+            executed.append((sql, params))
+
+        def close(self):
+            return None
+
+    class Database:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            executed.append(("commit", None))
+
+    monkeypatch.setattr(live_sync_recovery, "get_db_connection", lambda: Database())
+
+    live_sync_recovery.restore_live_sent_order_after_sync_error(
+        {"id": 41},
+        RuntimeError("snapshot mismatch"),
+    )
+
+    sql, params = executed[0]
+    assert "SET status = 'sent'" in sql
+    assert "status = 'syncing'" in sql
+    assert "live_fill_sync:retry_error" in sql
+    assert params == ("snapshot mismatch", 41)
+    assert executed[1] == ("commit", None)
+
+
+@pytest.mark.parametrize("exchange_id", ["gate", "okx", "bitget", "bybit", "binance", "htx"])
+def test_live_sent_sync_ignores_float_tail_across_crypto_exchanges(monkeypatch, exchange_id):
+    row = _row(filled=0.0048, avg_price=84_590.1)
+    row.update(
+        {
+            "exchange_id": exchange_id,
+            "amount": 0.005174558160819331,
+            "signal_type": "add_long",
+            "payload_json": (
+                '{"strategy_id":9,"strategy_run_id":3,"order_intent_id":5,'
+                '"signal_type":"add_long","amount":0.005174558160819331}'
+            ),
+        }
+    )
+    worker, snapshots, persisted = _worker(
+        monkeypatch,
+        row,
+        exchange_fill=(0.004800000000000001, 84_590.09999999999, "cancelled"),
+    )
+
+    worker._sync_one_live_sent_order(row)
+
+    assert persisted[0]["filled"] == 0
+    assert persisted[0]["cumulative_filled"] == pytest.approx(0.0048)
+    assert persisted[0]["cumulative_average_price"] == pytest.approx(84_590.1)
+    assert snapshots[0]["status"] == "cancelled"
+    assert snapshots[0]["filled"] == pytest.approx(0.0048)
 
 
 def test_live_sent_sync_finalizes_after_restart_without_duplicate_fill(monkeypatch):
@@ -308,6 +498,62 @@ def test_live_sent_sync_tracks_market_leg_without_overwriting_limit_fill(monkeyp
     assert snapshots[0]["filled"] == pytest.approx(1.0)
     assert snapshots[0]["avg_price"] == pytest.approx(101.0)
     assert snapshots[0]["status"] == "filled"
+
+
+def test_close_retry_leg_baseline_does_not_double_book_fill(monkeypatch):
+    row = _row(filled=4.76, avg_price=100.0)
+    row["signal_type"] = "close_short"
+    row["amount"] = 4.76
+    row["exchange_order_id"] = "retry-1"
+    row["exchange_response_json"] = json.dumps({"phases": {
+        "close_reconciliation": {
+            "status": "closed",
+            "target_quantity": 4.76,
+            "remaining_quantity": 0.0,
+            "retry_orders": [{
+                "exchange_order_id": "retry-1",
+                "filled_quantity": 1.9,
+                "avg_price": 100.0,
+            }],
+        }
+    }})
+    worker, snapshots, persisted = _worker(
+        monkeypatch,
+        row,
+        exchange_fill=(1.9, 100.0, "filled"),
+    )
+
+    worker._sync_one_live_sent_order(row)
+
+    assert len(persisted) == 1
+    assert persisted[0]["filled"] == 0
+    assert snapshots[0]["filled"] == pytest.approx(4.76)
+    assert snapshots[0]["status"] == "filled"
+
+
+def test_unresolved_close_reconciliation_cannot_be_promoted_by_child_status(monkeypatch):
+    row = _row(filled=2.86, avg_price=100.0)
+    row["signal_type"] = "close_short"
+    row["amount"] = 4.76
+    row["exchange_response_json"] = json.dumps({"phases": {
+        "close_reconciliation": {
+            "status": "partial",
+            "target_quantity": 4.76,
+            "remaining_quantity": 1.9,
+            "retry_orders": [],
+        }
+    }})
+    worker, snapshots, _persisted = _worker(
+        monkeypatch,
+        row,
+        exchange_fill=(2.86, 100.0, "filled"),
+    )
+
+    worker._sync_one_live_sent_order(row)
+
+    assert snapshots[0]["status"] == "sent"
+    response = json.loads(snapshots[0]["exchange_response_json"])
+    assert response["phases"]["close_reconciliation"]["status"] == "partial"
 
 
 def test_restart_after_market_poll_timeout_books_only_the_market_tail(monkeypatch):

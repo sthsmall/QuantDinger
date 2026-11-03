@@ -30,7 +30,7 @@ def fresh_module(monkeypatch):
 
 
 def test_mcp_tool_registry_complete(fresh_module):
-    assert len(fresh_module.MCP_TOOL_NAMES) == 58
+    assert len(fresh_module.MCP_TOOL_NAMES) == 59
     # Every exported name should correspond to a registered @mcp.tool function.
     for name in fresh_module.MCP_TOOL_NAMES:
         assert hasattr(fresh_module, name), f"missing tool function: {name}"
@@ -289,6 +289,21 @@ def test_submit_backtest_uses_strategy_v2_payload(monkeypatch, fresh_module):
         "leverageEnabled", "leverage", "params",
     }
     assert captured["headers"] == {"Idempotency-Key": "same-key"}
+
+
+def test_compile_strategy_code_forwards_idempotency_key(monkeypatch, fresh_module):
+    captured = {}
+
+    def fake_post(path, json=None, headers=None):
+        captured.update(path=path, json=json, headers=headers)
+        return {"manifest": {"strategyType": "cta"}}
+
+    monkeypatch.setattr(fresh_module, "_post", fake_post)
+    out = fresh_module.compile_strategy_code(code="def initialize(context):\n    pass\n", idempotency_key="compile-1")
+
+    assert out == {"manifest": {"strategyType": "cta"}}
+    assert captured["path"] == "/api/agent/v1/strategy-sources/compile"
+    assert captured["headers"] == {"Idempotency-Key": "compile-1"}
 
 
 def test_strategy_source_workspace_payloads(monkeypatch, fresh_module):

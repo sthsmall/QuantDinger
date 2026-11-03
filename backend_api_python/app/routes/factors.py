@@ -1,18 +1,25 @@
 """Factor catalog and research APIs."""
 
-from flask import jsonify, request
+from flask import g, jsonify, request
 
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.services.factors import (
     FactorError,
     TalibFactorError,
-    get_factor,
+    get_factor_metadata,
     is_talib_available,
-    list_factors,
-    list_talib_factors,
+    list_factor_catalog,
 )
 from app.services.factors.research import information_coefficient, quantile_returns, winsorize_zscore
 from app.services.fundamental_data import get_fundamental_data_service
+from app.services.custom_factors import (
+    CustomFactorError,
+    analyze_custom_factor,
+    archive_custom_factor,
+    get_custom_factor,
+    list_custom_factors,
+    save_custom_factor,
+)
 from app.utils.auth import login_required
 from app.utils.logger import get_logger
 
@@ -28,23 +35,34 @@ def factor_catalog():
         factor_type = str(request.args.get("type") or request.args.get("factor_type") or "").strip()
         category = str(request.args.get("category") or "").strip()
         provider = str(request.args.get("provider") or "").strip().lower()
-        data = list_factors(
+        data = list_factor_catalog(
             category=category,
             factor_type=factor_type,
+            include_feature_families=True,
         )
-        talib_data = []
-        if provider in ("", "ta-lib", "talib") and is_talib_available() and factor_type != "fundamental":
-            talib_data = [
-                item for item in list_talib_factors()
-                if not category or item.get("category") == category
-            ]
+        custom = list_custom_factors(int(g.user_id))
+        if category:
+            custom = [item for item in custom if item.get("category") == category]
+        if factor_type:
+            custom = [item for item in custom if item.get("factor_type") == factor_type]
+        data.extend(custom)
+        if provider in ("ta-lib", "talib"):
+            data = [item for item in data if item.get("provider") == "ta-lib"]
+        elif provider in ("microsoft-qlib", "qlib"):
+            data = [item for item in data if item.get("provider") == "microsoft-qlib"]
+        elif provider:
+            data = [item for item in data if not item.get("provider")]
+        talib_count = sum(1 for item in data if item.get("provider") == "ta-lib")
+        qlib_count = sum(1 for item in data if item.get("provider") == "microsoft-qlib")
         return jsonify({
             "code": 1,
             "msg": "success",
-            "data": data + talib_data,
+            "data": data,
             "meta": {
-                "builtInCount": len(data),
-                "talibCount": len(talib_data),
+                "builtInCount": len(data) - talib_count - qlib_count,
+                "talibCount": talib_count,
+                "qlibCount": qlib_count,
+                "customCount": len(custom),
                 "talibAvailable": is_talib_available(),
             },
         })
@@ -59,8 +77,53 @@ def factor_catalog():
 @login_required
 def factor_detail(factor_id: str):
     try:
-        return jsonify({"code": 1, "msg": "success", "data": get_factor(factor_id).metadata()})
-    except FactorError as exc:
+        if factor_id.lower().startswith("custom:"):
+            return jsonify({"code": 1, "msg": "success", "data": get_custom_factor(int(g.user_id), factor_id)})
+        return jsonify({"code": 1, "msg": "success", "data": get_factor_metadata(factor_id)})
+    except (CustomFactorError, FactorError, TalibFactorError) as exc:
+        return jsonify({"code": 0, "msg": exc.code, "data": None}), 404
+
+
+@factors_blp.route("/custom/validate", methods=["POST"])
+@login_required
+def validate_custom_factor():
+    try:
+        payload = request.get_json(silent=True) or {}
+        params = payload.get("defaultParams") or {}
+        analysis = analyze_custom_factor(str(payload.get("expression") or ""), params)
+        return jsonify({
+            "code": 1,
+            "msg": "success",
+            "data": {
+                "requiredFields": list(analysis.required_fields),
+                "dependencies": list(analysis.dependencies),
+                "warmupBars": analysis.warmup_bars,
+            },
+        })
+    except CustomFactorError as exc:
+        return jsonify({"code": 0, "msg": exc.code, "data": None}), 400
+
+
+@factors_blp.route("/custom", methods=["POST"])
+@login_required
+def create_custom_factor():
+    try:
+        data = save_custom_factor(int(g.user_id), request.get_json(silent=True) or {})
+        return jsonify({"code": 1, "msg": "success", "data": data}), 201
+    except CustomFactorError as exc:
+        return jsonify({"code": 0, "msg": exc.code, "data": None}), 400
+    except Exception:
+        logger.exception("custom factor creation failed")
+        return jsonify({"code": 0, "msg": "factor.customSaveFailed", "data": None}), 500
+
+
+@factors_blp.route("/custom/<int:factor_id>", methods=["DELETE"])
+@login_required
+def delete_custom_factor(factor_id: int):
+    try:
+        archive_custom_factor(int(g.user_id), factor_id)
+        return jsonify({"code": 1, "msg": "success", "data": {"id": factor_id}})
+    except CustomFactorError as exc:
         return jsonify({"code": 0, "msg": exc.code, "data": None}), 404
 
 

@@ -72,6 +72,7 @@ MCP_TOOL_NAMES = (
     "list_universe_members",
     "list_factors",
     "get_factor",
+    "submit_factor_benchmark",
     "list_watchlist",
     "add_watchlist",
     "remove_watchlist",
@@ -689,7 +690,11 @@ def list_strategy_templates(limit: int = 20) -> Any:
 
 
 @_tool
-def compile_strategy_code(code: str | None = None, source_id: int | None = None) -> Any:
+def compile_strategy_code(
+    code: str | None = None,
+    source_id: int | None = None,
+    idempotency_key: str = "",
+) -> Any:
     """Compile Strategy API V2 code and return its canonical manifest without saving."""
     payload: dict[str, Any] = {}
     if code is not None:
@@ -699,7 +704,11 @@ def compile_strategy_code(code: str | None = None, source_id: int | None = None)
         payload["source_id"] = int(source_id)
     if not payload:
         raise ValueError("code or source_id is required")
-    return _post("/api/agent/v1/strategy-sources/compile", json=payload)
+    return _post(
+        "/api/agent/v1/strategy-sources/compile",
+        json=payload,
+        headers=_idempotency_headers(idempotency_key),
+    )
 
 
 @_tool
@@ -900,6 +909,48 @@ def list_factors(category: str = "", factor_type: str = "") -> Any:
 def get_factor(factor_id: str) -> Any:
     """Get one factor definition and parameter schema."""
     return _get(f"/api/agent/v1/research/factors/{factor_id}")
+
+
+@_tool
+def submit_factor_benchmark(
+    universe_id: int,
+    factor_ids: list[str],
+    start_date: str,
+    end_date: str,
+    idempotency_key: str,
+    frequency: str = "1d",
+    groups: int = 5,
+    holding_period: int = 5,
+    commission: float = 0.0005,
+    slippage: float = 0.0005,
+    neutralize_industry: bool = False,
+    train_fraction: float = 0.6,
+    false_discovery_rate: float = 0.1,
+    minimum_abs_oos_ic: float = 0.02,
+) -> Any:
+    """Submit a multi-factor out-of-sample benchmark job."""
+    cleaned = list(dict.fromkeys(str(item).strip() for item in factor_ids if str(item).strip()))
+    if len(cleaned) < 2:
+        raise ValueError("factor_ids must contain at least two unique factors")
+    return _post(
+        "/api/agent/v1/research/factor-benchmarks",
+        json={
+            "universeId": int(universe_id),
+            "factors": [{"factorId": factor_id} for factor_id in cleaned],
+            "startDate": start_date,
+            "endDate": end_date,
+            "frequency": frequency,
+            "groups": max(2, min(10, int(groups))),
+            "holdingPeriod": max(1, int(holding_period)),
+            "commission": max(0.0, float(commission)),
+            "slippage": max(0.0, float(slippage)),
+            "neutralizeIndustry": bool(neutralize_industry),
+            "trainFraction": min(0.8, max(0.5, float(train_fraction))),
+            "falseDiscoveryRate": min(0.5, max(0.001, float(false_discovery_rate))),
+            "minimumAbsOosIc": max(0.0, float(minimum_abs_oos_ic)),
+        },
+        headers=_idempotency_headers(idempotency_key),
+    )
 
 
 @_tool

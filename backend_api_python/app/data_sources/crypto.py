@@ -14,7 +14,7 @@ from app.data_sources.native_crypto import (
     normalize_market_type,
 )
 from app.utils.logger import get_logger
-from app.config import CryptoPublicConfig, APIKeys
+from app.config import CryptoPublicConfig
 
 logger = get_logger(__name__)
 
@@ -394,8 +394,6 @@ class CryptoDataSource(BaseDataSource):
         if not normalized or not base:
             return symbol
         
-        exchange_id = getattr(self.exchange, 'id', '').lower()
-        
         if self._ensure_markets_loaded():
             valid_symbol = self._find_valid_symbol(base, normalized.split('/')[1] if '/' in normalized else 'USDT')
             if valid_symbol:
@@ -451,7 +449,6 @@ class CryptoDataSource(BaseDataSource):
             if ticker and isinstance(ticker, dict):
                 return ticker
         except Exception as e:
-            error_msg = str(e).lower()
             is_symbol_error = _is_symbol_not_found_error(e)
             
             if is_symbol_error:
@@ -674,9 +671,8 @@ class CryptoDataSource(BaseDataSource):
             # Concise trace so backtest logs can correlate requested window with actual window
             if klines:
                 try:
-                    from datetime import datetime as _dt
-                    first_ts = _dt.utcfromtimestamp(klines[0]['time']).isoformat()
-                    last_ts = _dt.utcfromtimestamp(klines[-1]['time']).isoformat()
+                    first_ts = datetime.fromtimestamp(klines[0]["time"], timezone.utc).isoformat()
+                    last_ts = datetime.fromtimestamp(klines[-1]["time"], timezone.utc).isoformat()
                     logger.info(
                         f"[CryptoKline] {symbol} {timeframe} returned {len(klines)} candles, "
                         f"utc_range={first_ts}~{last_ts}, limit={limit}, before_time={before_time}"

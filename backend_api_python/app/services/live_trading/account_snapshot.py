@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from app.services.exchange_execution import resolve_exchange_config
 from app.services.live_trading.factory import create_client
@@ -163,6 +163,8 @@ def _parse_swap_position_items(items: List[Dict[str, Any]], *, market_type: str 
         try:
             entry = float(
                 item.get("avgPx")
+                or item.get("avgPrice")
+                or item.get("entry_price")
                 or item.get("entryPrice")
                 or item.get("openPriceAvg")
                 or item.get("avgEntryPrice")

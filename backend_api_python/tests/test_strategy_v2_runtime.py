@@ -38,6 +38,63 @@ def _rules(key: str, *, amount_step: float, min_notional: float = 0.0, min_amoun
     }
 
 
+@pytest.mark.parametrize(("current_equity", "expected_reason"), [
+    (700.0, "strategy_equity_stop_loss"),
+    (1500.0, "strategy_equity_take_profit"),
+])
+def test_deployment_equity_limits_cancel_orders_and_close_strategy_positions(
+    current_equity,
+    expected_reason,
+):
+    code = """
+def initialize(context):
+    context.set_universe(["USStock:AAPL"])
+    context.subscribe(frequency="1d")
+
+def handle_data(context, data):
+    pass
+"""
+    session = StrategyV2LiveSession(
+        code=code,
+        frames={"USStock:AAPL": _frame([100, 101])},
+        initial_capital=1000,
+        deployment_risk={
+            "equity_stop_loss_pct": 0.30,
+            "equity_take_profit_pct": 0.50,
+        },
+    )
+    session.synchronize_positions({
+        "USStock:AAPL": {
+            "amount": 2,
+            "side": "long",
+            "avg_cost": 100,
+            "last_price": 101,
+        },
+    }, total_value=current_equity)
+    session.context.update_order_statuses({
+        "open-order": {"client_order_id": "open-order", "status": "submitted"},
+    })
+
+    orders, messages, reason = session.evaluate_equity_risk()
+
+    assert reason == expected_reason
+    assert len(orders) == 1
+    assert orders[0].kind == "target_quantity"
+    assert orders[0].value == 0
+    assert orders[0].reason == expected_reason
+    assert orders[0].position_side == ""
+    assert session.context.flush_cancelled_order_ids() == {"open-order"}
+    assert messages == []
+
+    repeated_orders, repeated_messages, repeated_reason = session.evaluate_equity_risk()
+    assert repeated_orders == []
+    assert repeated_messages == []
+    assert repeated_reason == expected_reason
+
+    session.release_equity_risk_exit()
+    assert session.evaluate_equity_risk()[2] == expected_reason
+
+
 def test_data_portal_caches_timestamps_and_slices_point_in_time_history():
     portal = MultiAssetDataPortal({"USStock:AAPL": _frame(range(1000))})
     cached_timestamps = portal.timestamps
@@ -657,6 +714,39 @@ def handle_data(context, data):
     assert result["winRate"] == 100.0
     assert result["profitFactor"] > 0
     assert result["avgTrade"] > 0
+    assert result["rebalanceRecords"][1]["targetWeights"] == {"USStock:AAPL": 0.0}
+
+
+def test_rebalance_records_omit_zero_targets_for_already_flat_symbols():
+    code = """
+def initialize(context):
+    context.set_universe(["USStock:AAPL", "USStock:MSFT"])
+    context.subscribe(frequency="1d")
+    g.sent = False
+
+def handle_data(context, data):
+    if not g.sent:
+        order_target_percent("AAPL", 0.5, reason="entry")
+        order_target_percent("MSFT", 0.0, reason="already_flat")
+        g.sent = True
+"""
+    result = StrategyV2BacktestRunner(
+        code=code,
+        frames={
+            "USStock:AAPL": _frame([100, 101, 102]),
+            "USStock:MSFT": _frame([200, 201, 202]),
+        },
+        initial_capital=10000,
+        commission=0,
+        slippage=0,
+    ).run()
+
+    assert result["rebalanceRecords"][0]["targetWeights"] == {"USStock:AAPL": 0.5}
+    assert any(
+        row["symbol"] == "USStock:MSFT"
+        and row["statusReason"] == "target_already_met"
+        for row in result["orderLedger"]
+    )
 
 
 def test_live_session_processes_each_closed_bar_once_and_preserves_state():
@@ -1564,3 +1654,67 @@ def handle_data(context, data):
     ).run()
 
     assert result["totalExecutions"] == 0
+
+
+
+def test_result_includes_downside_risk_and_drawdown_recovery_metrics():
+    runner = StrategyV2BacktestRunner(
+        code="""
+def initialize(context):
+    context.set_universe(["USStock:AAPL"])
+    context.subscribe(frequency="1d")
+
+def handle_data(context, data):
+    pass
+""",
+        frames={"USStock:AAPL": _frame([100, 101, 102])},
+        initial_capital=100,
+        commission=0,
+        slippage=0,
+    )
+    runner.broker.equity_curve = [
+        {"time": "2026-01-01", "value": 100.0},
+        {"time": "2026-01-02", "value": 120.0},
+        {"time": "2026-01-03", "value": 90.0},
+        {"time": "2026-01-05", "value": 125.0},
+    ]
+    runner.broker.portfolio.total_value = 125.0
+
+    result = runner._result()
+
+    assert "sortinoRatio" in result
+    assert "calmarRatio" in result
+    assert "downsideDeviation" in result
+    assert "annualizedDownsideDeviation" in result
+    assert "maxDrawdownDurationDays" in result
+    assert "maxDrawdownRecoveryTime" in result
+    assert "maxDrawdownRecoveryDays" in result
+    assert "maxDrawdownRecovered" in result
+    assert "recoveryFactor" in result
+
+    assert result["maxDrawdown"] == pytest.approx(-25.0)
+    assert result["maxDrawdownRecovered"] is True
+    assert result["maxDrawdownRecoveryTime"] == "2026-01-05"
+    assert result["maxDrawdownRecoveryDays"] == pytest.approx(3.0)
+    assert result["recoveryFactor"] == pytest.approx((125.0 - 100.0) / (120.0 - 90.0))
+    assert result["sortinoRatio"] is not None
+    assert result["calmarRatio"] is not None
+    assert "omegaRatio" in result
+    assert "valueAtRisk95" in result
+    assert "valueAtRisk99" in result
+    assert "cvar95" in result
+    assert "cvar99" in result
+    assert "parametricVaR95" in result
+    assert "parametricVaR99" in result
+    assert "tailRatio" in result
+    assert "skewness" in result
+    assert "kurtosis" in result
+    assert result["tailRiskStatus"] == "insufficient_history"
+    assert result["tailRiskObservations"] == 3
+    assert result["tailRiskUnit"] == "return_fraction"
+    assert result["valueAtRisk95Status"] == "insufficient_history"
+    assert result["valueAtRisk99Status"] == "insufficient_history"
+    assert result["omegaRatio"] is not None
+    assert result["valueAtRisk95"] is None
+    assert result["cvar95"] is None
+    assert result["tailRatio"] is None

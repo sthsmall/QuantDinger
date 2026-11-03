@@ -13,7 +13,6 @@ Live ownership:
 
 from __future__ import annotations
 
-import time
 import json
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING
 
@@ -184,7 +183,11 @@ def _fetch_position_fuzzy(strategy_id: int, symbol: str, side: str) -> Tuple[Dic
     return {}, canon
 
 
-def strategy_allowed_symbols(strategy_config: Dict[str, Any]) -> Set[str]:
+def strategy_allowed_symbols(
+    strategy_config: Dict[str, Any],
+    *,
+    strategy_id: int = 0,
+) -> Set[str]:
     """
     Symbols a strategy is allowed to own in ``qd_strategy_positions``.
 
@@ -197,9 +200,11 @@ def strategy_allowed_symbols(strategy_config: Dict[str, Any]) -> Set[str]:
     if not isinstance(trading_config, dict):
         trading_config = {}
 
+    dynamic_universe = False
     for raw in (strategy_config.get("symbol"), trading_config.get("symbol")):
         text = str(raw or "").strip()
         if text.lower().startswith(("basket:", "universe:")):
+            dynamic_universe = True
             continue
         norm = normalize_strategy_symbol(text)
         if norm:
@@ -208,6 +213,8 @@ def strategy_allowed_symbols(strategy_config: Dict[str, Any]) -> Set[str]:
     manifest = trading_config.get("strategy_manifest") or trading_config.get("strategyManifest") or {}
     if isinstance(manifest, dict):
         universe = manifest.get("universe") or {}
+        if isinstance(universe, dict) and str(universe.get("reference") or "").strip():
+            dynamic_universe = True
         instruments = universe.get("instruments") or [] if isinstance(universe, dict) else []
         for instrument in instruments:
             if not isinstance(instrument, dict):
@@ -215,6 +222,31 @@ def strategy_allowed_symbols(strategy_config: Dict[str, Any]) -> Set[str]:
             norm = normalize_strategy_symbol(str(instrument.get("symbol") or "").strip())
             if norm:
                 allowed.add(norm.upper())
+
+    # A reference-backed portfolio owns the concrete symbols created by its own
+    # fills. They are not persisted in the static manifest, so include only this
+    # strategy's ledger symbols when reconciling its exchange snapshot.
+    sid = int(strategy_id or strategy_config.get("strategy_id") or strategy_config.get("id") or 0)
+    if dynamic_universe and sid > 0:
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    SELECT symbol FROM qd_strategy_positions WHERE strategy_id = %s
+                    UNION
+                    SELECT symbol FROM qd_strategy_trades WHERE strategy_id = %s
+                    """,
+                    (sid, sid),
+                )
+                rows = cur.fetchall() or []
+                cur.close()
+            for row in rows:
+                norm = normalize_strategy_symbol(str(row.get("symbol") or "").strip())
+                if norm:
+                    allowed.add(norm.upper())
+        except Exception:
+            pass
 
     return allowed
 
@@ -505,6 +537,7 @@ def record_trade(
     fee_source: str = "",
     fees_by_ccy: Optional[Dict[str, float]] = None,
     exchange_order_id: str = "",
+    created_at: Optional[Any] = None,
 ) -> int:
     value = float(amount or 0.0) * float(price or 0.0)
     if user_id is None:
@@ -539,7 +572,7 @@ def record_trade(
              strategy_run_id, order_intent_id, execution_event_id, exchange_fill_id,
              fee_status, fee_source, commission_breakdown, exchange_order_id, created_at)
             VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, NOW()))
             ON CONFLICT (execution_event_id) WHERE execution_event_id > 0 DO NOTHING
             RETURNING id
             """,
@@ -573,6 +606,7 @@ def record_trade(
                 str(fee_source or ""),
                 json.dumps(fees_by_ccy or ({commission_ccy: commission} if commission_ccy and commission_ccy != 'MIXED' else {})),
                 str(exchange_order_id or ''),
+                created_at,
             ),
         )
         row = cur.fetchone()

@@ -12,9 +12,8 @@ import json
 import math
 import os
 import threading
-import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
@@ -22,6 +21,7 @@ import pandas as pd
 
 from app.services.kline import KlineService
 from app.services.signal_notifier import SignalNotifier
+from app.services.strategy_v2.frequencies import normalize_frequency
 from app.services.user_preferences import get_notification_settings
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
@@ -760,7 +760,7 @@ class IndicatorSignalAlertService:
     def _format_bar_time(self, value: Any, idx: int) -> str:
         if isinstance(value, (int, float)):
             try:
-                return datetime.utcfromtimestamp(value).isoformat()
+                return datetime.fromtimestamp(value, timezone.utc).replace(tzinfo=None).isoformat()
             except Exception:
                 return str(value)
         return str(value or idx)
@@ -1000,16 +1000,18 @@ class IndicatorSignalAlertService:
             cur.close()
 
     def _poll_seconds(self, timeframe: str) -> int:
-        tf = str(timeframe or "").strip()
+        tf = normalize_frequency(timeframe, default="")
         mapping = {
             "1m": 20,
+            "3m": 25,
             "5m": 30,
             "15m": 60,
             "30m": 90,
-            "1H": 120,
-            "4H": 300,
-            "1D": 600,
-            "1W": 1800,
+            "1h": 120,
+            "4h": 300,
+            "1d": 600,
+            "1w": 1800,
+            "1mo": 3600,
         }
         return mapping.get(tf, 120)
 

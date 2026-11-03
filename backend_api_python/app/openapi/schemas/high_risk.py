@@ -59,6 +59,11 @@ class CredentialCreateRequestSchema(Schema):
     network = fields.String(load_default="", validate=validate.Length(max=32))
     market_scope = fields.String(load_default="", validate=validate.OneOf(["", "spot", "swap", "both"]))
     marketScope = fields.String(load_default="", validate=validate.Length(max=32))
+    bitget_account_mode = fields.String(
+        load_default="",
+        validate=validate.OneOf(["", "auto", "classic", "uta"]),
+    )
+    bitgetAccountMode = fields.String(load_default="", validate=validate.Length(max=32))
     ibkr_host = fields.String(load_default="127.0.0.1", validate=validate.Length(max=255))
     ibkr_port = fields.Integer(load_default=7497, validate=validate.Range(min=1, max=65535))
     ibkr_client_id = fields.Integer(load_default=7, validate=validate.Range(min=0, max=2147483647))
@@ -78,11 +83,6 @@ class CredentialCreateRequestSchema(Schema):
             raise ValidationError("api_key is required", field_name="api_key")
         if not (data.get("secret_key") or data.get("secretKey")):
             raise ValidationError("secret_key is required", field_name="secret_key")
-
-
-class CredentialRenameRequestSchema(Schema):
-    id = fields.Integer(required=True, validate=validate.Range(min=1))
-    name = fields.String(required=True, validate=validate.Length(max=128))
 
 
 class BillingOrderRequestSchema(Schema):
@@ -123,6 +123,8 @@ class QuickTradeOrderRequestSchema(Schema):
     amount = fields.Float(load_default=0, validate=validate.Range(min=0))
     quantity = fields.Float(load_default=0, validate=validate.Range(min=0))
     price = fields.Float(load_default=0, validate=validate.Range(min=0))
+    reference_price = fields.Float(load_default=0, validate=validate.Range(min=0))
+    reference_price_at_ms = fields.Integer(load_default=0, validate=validate.Range(min=0))
     leverage = fields.Integer(load_default=1, validate=validate.Range(min=1, max=125))
     market_type = fields.String(
         load_default="",
@@ -133,7 +135,6 @@ class QuickTradeOrderRequestSchema(Schema):
     source = fields.String(load_default="manual", validate=validate.Length(max=64))
     margin_mode = fields.String(load_default="", validate=validate.Length(max=16))
     marginMode = fields.String(load_default="", validate=validate.Length(max=16))
-    ai_decision_filter = fields.Boolean(load_default=False)
     instrument_id = fields.String(load_default="", validate=validate.Length(max=128))
     product_type = fields.String(load_default="", validate=validate.Length(max=64))
     api_family = fields.String(load_default="", validate=validate.Length(max=64))
@@ -163,6 +164,8 @@ class QuickTradeOrderRequestSchema(Schema):
 
 
 class QuickTradeCloseRequestSchema(Schema):
+    order_type = fields.String(load_default="market", validate=validate.OneOf(("market", "limit")))
+    price = fields.Float(load_default=0, validate=validate.Range(min=0))
     credential_id = fields.Integer(required=True, validate=validate.Range(min=1))
     symbol = fields.String(required=True, validate=validate.Length(min=1, max=64))
     market_type = fields.String(
@@ -199,6 +202,16 @@ class QuickTradeCancelRequestSchema(Schema):
     trade_id = fields.Integer(required=True, validate=validate.Range(min=1))
 
 
+class QuickTradeProtectionRequestSchema(Schema):
+    credential_id = fields.Integer(required=True, validate=validate.Range(min=1))
+    symbol = fields.String(required=True, validate=validate.Length(min=1, max=64))
+    position_side = fields.String(required=True, validate=validate.OneOf(("long", "short")))
+    action = fields.String(load_default="create", validate=validate.OneOf(("create", "cancel")))
+    kind = fields.String(load_default="tp", validate=validate.OneOf(("tp", "sl")))
+    price = fields.Float(load_default=0, validate=validate.Range(min=0))
+    order_id = fields.String(load_default="", validate=validate.Length(max=64))
+
+
 class UserInfoSchema(Schema):
     id = fields.Integer()
     username = fields.String()
@@ -218,16 +231,6 @@ class LoginResponseSchema(Schema):
     code = fields.Integer(required=True)
     msg = fields.String(required=True)
     data = fields.Nested(LoginDataSchema, allow_none=True)
-
-
-class StrategyStatusDataSchema(Schema):
-    status = fields.String(allow_none=True)
-
-
-class StrategyStatusResponseSchema(Schema):
-    code = fields.Integer(required=True)
-    msg = fields.String(required=True)
-    data = fields.Nested(StrategyStatusDataSchema, allow_none=True)
 
 
 class CredentialCreatedDataSchema(Schema):

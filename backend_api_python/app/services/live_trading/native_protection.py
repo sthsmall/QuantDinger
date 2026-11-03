@@ -121,13 +121,18 @@ def _place_binance(client: Any, request: NativeProtectionRequest) -> List[Dict[s
     if not dual:
         base["reduceOnly"] = "true"
     responses: List[Dict[str, Any]] = []
-    for kind, price in (
-        ("STOP_MARKET", request.stop_loss_price),
-        ("TAKE_PROFIT_MARKET", request.take_profit_price),
+    for kind, price, suffix in (
+        ("STOP_MARKET", request.stop_loss_price, "sl"),
+        ("TAKE_PROFIT_MARKET", request.take_profit_price, "tp"),
     ):
         if price <= 0:
             continue
         body = dict(base, type=kind, triggerPrice=str(price))
+        client_algo_id = client._format_client_order_id(
+            f"{request.client_order_id}-{suffix}" if request.client_order_id else ""
+        )
+        if client_algo_id:
+            body["clientAlgoId"] = client_algo_id
         responses.append(client._signed_request("POST", "/fapi/v1/algoOrder", params=body))
     if request.trailing_stop_pct > 0:
         callback = min(10.0, max(0.1, request.trailing_stop_pct * 100.0))
@@ -135,6 +140,11 @@ def _place_binance(client: Any, request: NativeProtectionRequest) -> List[Dict[s
         activation = _activation_price(request)
         if activation > 0:
             body["activatePrice"] = str(activation)
+        client_algo_id = client._format_client_order_id(
+            f"{request.client_order_id}-trail" if request.client_order_id else ""
+        )
+        if client_algo_id:
+            body["clientAlgoId"] = client_algo_id
         responses.append(client._signed_request("POST", "/fapi/v1/algoOrder", params=body))
     return responses
 
@@ -178,6 +188,76 @@ def _place_okx(client: Any, request: NativeProtectionRequest) -> List[Dict[str, 
 
 
 def _place_bitget(client: Any, request: NativeProtectionRequest) -> List[Dict[str, Any]]:
+    resolver = getattr(client, "_resolve_bitget_client", None)
+    if callable(resolver):
+        client = resolver()
+    from app.services.live_trading.bitget_classic import BitgetClassicMixClient
+
+    if isinstance(client, BitgetClassicMixClient):
+        return _place_bitget_classic(client, request)
+
+    size, precision = client._normalize_size(
+        symbol=request.symbol,
+        product_type=request.product_type,
+        base_size=request.quantity,
+    )
+    close_side = "sell" if request.pos_side == "long" else "buy"
+    base = {
+        "category": request.product_type.upper(),
+        "symbol": to_bitget_um_symbol(request.symbol),
+        "type": "tpsl",
+        "side": close_side,
+        "posSide": request.pos_side,
+        "marginMode": "isolated" if request.margin_mode == "isolated" else "crossed",
+        "tpslMode": "partial",
+        "reduceOnly": "yes",
+        "qty": client._dec_str(size, strict_precision=precision),
+    }
+    responses: List[Dict[str, Any]] = []
+    if request.stop_loss_price > 0 or request.take_profit_price > 0:
+        body = dict(base)
+        if request.stop_loss_price > 0:
+            body.update(
+                stopLoss=str(request.stop_loss_price),
+                slTriggerBy="mark",
+                slOrderType="market",
+            )
+        if request.take_profit_price > 0:
+            body.update(
+                takeProfit=str(request.take_profit_price),
+                tpTriggerBy="mark",
+                tpOrderType="market",
+            )
+        if request.client_order_id:
+            body["clientOid"] = str(request.client_order_id)[:32]
+        responses.append(
+            client._signed_request("POST", "/api/v3/trade/place-strategy-order", json_body=body)
+        )
+    if request.trailing_stop_pct > 0:
+        body = {
+            "category": request.product_type.upper(),
+            "symbol": to_bitget_um_symbol(request.symbol),
+            "type": "trailing_stop",
+            "side": close_side,
+            "posSide": request.pos_side,
+            "marginMode": "isolated" if request.margin_mode == "isolated" else "crossed",
+            "reduceOnly": "yes",
+            "qty": client._dec_str(size, strict_precision=precision),
+            "trailingStopParams": {
+                "activationPrice": str(_activation_price(request) or request.entry_price),
+                "activationType": "mark",
+                "trailType": "ratio",
+                "trailVariance": str(request.trailing_stop_pct * 100.0),
+                "preOrderType": "market",
+            },
+        }
+        responses.append(
+            client._signed_request("POST", "/api/v3/trade/place-strategy-order", json_body=body)
+        )
+    return responses
+
+
+def _place_bitget_classic(client: Any, request: NativeProtectionRequest) -> List[Dict[str, Any]]:
     size, precision = client._normalize_size(
         symbol=request.symbol,
         product_type=request.product_type,
@@ -203,7 +283,11 @@ def _place_bitget(client: Any, request: NativeProtectionRequest) -> List[Dict[st
         if request.client_order_id:
             body["clientOid"] = f"{request.client_order_id}-{suffix}"[:64]
         responses.append(
-            client._signed_request("POST", "/api/v2/mix/order/place-tpsl-order", json_body=body)
+            client._signed_request(
+                "POST",
+                "/api/v2/mix/order/place-tpsl-order",
+                json_body=body,
+            )
         )
     if request.trailing_stop_pct > 0:
         body = dict(
@@ -214,7 +298,11 @@ def _place_bitget(client: Any, request: NativeProtectionRequest) -> List[Dict[st
         )
         body.pop("executePrice", None)
         responses.append(
-            client._signed_request("POST", "/api/v2/mix/order/place-tpsl-order", json_body=body)
+            client._signed_request(
+                "POST",
+                "/api/v2/mix/order/place-tpsl-order",
+                json_body=body,
+            )
         )
     return responses
 

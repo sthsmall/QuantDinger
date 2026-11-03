@@ -208,6 +208,7 @@ def test_equity_market_order_accepts_notional_for_buy_and_sell(mock_ensure, _moc
     }
     mock_ensure.return_value = modules
     trading = MagicMock()
+    trading.get_asset.return_value = SimpleNamespace(tradable=True, fractionable=True)
     order = SimpleNamespace(
         id="order-notional",
         filled_qty="0",
@@ -233,6 +234,58 @@ def test_equity_market_order_accepts_notional_for_buy_and_sell(mock_ensure, _moc
         "symbol": "AAPL", "notional": 75.25, "side": "sell", "time_in_force": "day"
     }
     trading.get_all_positions.assert_not_called()
+
+
+@patch("app.services.alpaca_trading.client._ensure_alpaca")
+def test_equity_notional_order_rejects_non_fractionable_asset_before_submit(mock_ensure):
+    mock_ensure.return_value = {
+        "MarketOrderRequest": MagicMock(),
+        "OrderSide": SimpleNamespace(BUY="buy", SELL="sell"),
+        "TimeInForce": SimpleNamespace(GTC="gtc", DAY="day"),
+    }
+    trading = MagicMock()
+    trading.get_asset.return_value = SimpleNamespace(tradable=True, fractionable=False)
+    client = AlpacaClient(AlpacaConfig(api_key="PKtest", secret_key="secret", paper=True))
+    client._trading_client = trading
+    client._account_id = "account-1"
+
+    result = client.place_market_order("SPCX", "buy", notional=100)
+
+    assert result.success is False
+    assert "quickTrade.alpacaFractionalNotSupported" in result.message
+    trading.submit_order.assert_not_called()
+
+
+def test_account_summary_preserves_buying_power_breakdown():
+    trading = MagicMock()
+    trading.get_account.return_value = SimpleNamespace(
+        id="account-1",
+        currency="USD",
+        buying_power="157853",
+        regt_buying_power="80000",
+        daytrading_buying_power="120000",
+        non_marginable_buying_power="97500",
+        cash="97644",
+        portfolio_value="97644",
+        equity="97644",
+        last_equity="97644",
+        daytrade_count="0",
+        status="ACTIVE",
+        pattern_day_trader=False,
+        trading_blocked=False,
+        transfers_blocked=False,
+        account_blocked=False,
+    )
+    client = AlpacaClient(AlpacaConfig(api_key="PKtest", secret_key="secret", paper=True))
+    client._trading_client = trading
+    client._account_id = "account-1"
+
+    summary = client.get_account_summary()
+
+    assert summary["buying_power"] == "157853"
+    assert summary["regt_buying_power"] == "80000"
+    assert summary["daytrading_buying_power"] == "120000"
+    assert summary["non_marginable_buying_power"] == "97500"
 
 
 @patch("app.services.alpaca_trading.client.time.sleep", return_value=None)
@@ -335,6 +388,35 @@ def test_order_status_can_recover_by_client_order_id():
     assert result is expected
     trading.get_order_by_client_id.assert_called_once_with("qd_4_99")
     client.get_order_status.assert_called_once_with("recovered-order")
+
+
+def test_filled_equity_order_status_confirms_zero_commission():
+    trading = MagicMock()
+    trading.get_order_by_id.return_value = SimpleNamespace(
+        id="filled-equity-order",
+        symbol="AAPL",
+        side=SimpleNamespace(value="buy"),
+        qty="1",
+        filled_qty="1",
+        filled_avg_price="210.5",
+        status=SimpleNamespace(value="filled"),
+        asset_class=SimpleNamespace(value="us_equity"),
+        commission=0,
+        submitted_at="2026-10-26T13:35:00Z",
+        filled_at="2026-10-26T13:35:01Z",
+        canceled_at=None,
+    )
+    client = AlpacaClient(AlpacaConfig(api_key="PKtest", secret_key="secret", paper=True))
+    client._trading_client = trading
+    client._account_id = "account-1"
+
+    result = client.get_order_status("filled-equity-order")
+
+    assert result.success is True
+    assert result.raw["commission_quote"] == 0.0
+    assert result.raw["commission_ccy"] == "USD"
+    assert result.raw["fees_by_ccy"] == {"USD": 0.0}
+    assert result.raw["fee_status"] == "actual_zero"
 
 
 @patch("app.services.alpaca_trading.client._ensure_alpaca")
